@@ -1,0 +1,70 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: RocksDB
+Upstream-Contact: https://opensource.fb.com/
+Source: https://github.com/facebook/rocksdb
+Copyright: Copyright (C) 2013- Facebook Database Engineering Team
+
+Files: *
+Copyright: Copyright (C) 2011- Facebook, Inc.,
+ Copyright (C) 2011- The LevelDB Authors,
+ Copyright (C) 2013- Sanjay Ghemawat <sanjay@google.com>,
+ Copyright (C) 2013- Jeff Dean <jeff@google.com>
+License: GPL-2 or Apache-2.0
+
+Files: java/benchmark/src/main/java/org/rocksdb/benchmark/DbBenchmark.java
+Copyright: Copyright (C) 2011 Dain Sundstrom <dain@iq80.com>,
+ Copyright (C) 2011 FuseSource Corp. https://fusesource.com
+License: Apache-2.0
+
+Files: debian/*
+Copyright: Copyright (C) 2015- Laszlo Boszormenyi (GCS) <gcs@debian.org>
+License: GPL-3+
+
+Files: debian/patches/ppc64.patch debian/patches/mips.patch debian/patches/arm.patch debian/patches/0001-replace-old-sync-with-new-atomic-builtin-equivalents.patch
+Copyright: Copyright (C) 2021 Khem Raj <raj.khem@gmail.com>
+License: GPL-2 or Apache-2.0
+
+Files: debian/patches/armv7_support.patch
+Copyright: Copyright (C) 2022 Dominik Peuscher <dominik.peuscher@check24.de>
+License: GPL-2 or Apache-2.0
+
+License: Apache-2.0
+ Licensed to the Apache Software Foundation (ASF) under one or more contributor
+ license agreements. The ASF licenses this work to You under the Apache License,
+ Version 2.0 (the "License"); you may not use this work except in compliance
+ with the License.  You may obtain a copy of the License at
+ .
+ https://www.apache.org/licenses/LICENSE-2.0
+ .
+ On Debian systems, the complete text of the Apache License Version 2.0
+ can be found in the file '/usr/share/common-licenses/Apache-2.0'.
+
+License: GPL-2
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation; under version 2 of the License.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the full text of the GNU General Public License version 2
+ can be found in the file `/usr/share/common-licenses/GPL-2'.
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems, the complete text of the GNU General Public License 3
+ can be found in the file `/usr/share/common-licenses/GPL-3'.

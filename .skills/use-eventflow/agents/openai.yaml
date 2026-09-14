@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use EventFlow"
+  short_description: "Build feature pipelines with EventFlow APIs"
+  default_prompt: "Use $use-eventflow to implement and verify a feature computation pipeline with the APIs available in this checkout."

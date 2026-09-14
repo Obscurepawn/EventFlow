@@ -1,0 +1,15 @@
+# Local source checkouts used for architecture research.
+/.reference-repos/
+
+# Local build outputs and generated run data.
+/build*/
+/run/
+/artifacts/
+*.core
+
+/compile_commands.json
+
+/.cache/
+
+# Local verification artifacts.
+/specs/verification/

@@ -1,0 +1,6 @@
+CompileFlags:
+  # CMake refreshes this database when run.sh configures the default build.
+  # The root Bear database remains a record of actual compiler invocations.
+  CompilationDatabase: build
+Index:
+  Background: Build

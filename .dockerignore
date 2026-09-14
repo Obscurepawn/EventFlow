@@ -1,0 +1,35 @@
+# Allow only the project build inputs and reviewer documentation.
+**
+!Dockerfile
+!.dockerignore
+!CMakeLists.txt
+!Makefile
+!.clang-format
+!README.md
+!cmake/
+!cmake/**
+!include/
+!include/**
+!src/
+!src/**
+!tests/
+!tests/**
+!examples/
+!examples/**
+!cpp3rdlib/
+!cpp3rdlib/**
+!docker/
+!docker/**
+
+# Keep private documents and local outputs out even inside allowed directories.
+**/*.pdf
+**/.git
+**/.git/**
+**/.cache
+**/.cache/**
+**/build*
+**/build*/**
+**/*.core
+**/*.tar.gz
+**/compile_commands.json
+
