@@ -1,7 +1,9 @@
 # 新闻示例的独立读者文档与 API 审查
 
-Reviewer: news_docs_review（独立 fresh-context reviewer）  
-Date: 2026-09-15  
+Reviewer: news_docs_review（独立 fresh-context reviewer）
+
+Date: 2026-09-15
+
 Status: 本轮审查完成；一项措辞发现已定向修复并核对关闭，无本范围未解决阻断项。
 
 ## 范围与依据
