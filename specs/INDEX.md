@@ -1,5 +1,13 @@
 # 开发规格索引
 
+## 最近完成的 README 图示更新
+
+[README 架构与消息处理时序图](readme-archify-diagrams.md)已完成：详细架构图展开 Compute 内部组件，时序图采用用户指定 SVG 对应的 PNG。README 仅嵌入静态图；同轮双 reviewer 发现已记录并定向处置，本次 20 个未引用中间文件已移出，存量图片保留。见[本轮验证](reviews/README-diagrams-validation.md)。
+
+## 最近完成的新闻流示例调整
+
+[六字段新闻流示例](news-streaming-example.md)已完成：接收新闻时间、标题、正文、预赋值情绪与当时价格，按 ticker 维护两级 MV，并由条件/Clock 计算影响指标。六字段 SQL 回读、51.5/128/53、固定输入及正常 checkpoint 经最终 Debug/Release 五进程实跑验证；六个相关测试目标、文档/片段/DAG 检查与同轮双 reviewer 审查完成。既有成交例验证保留为历史快照，不作为本轮新闻结果证据。
+
 ## 最近完成的 README 使用示例补充
 
 [README 使用示例](readme-usage-examples.md)已完成：补充当前物化视图 DDL、声明式 Trigger 和内置触发审计的 SQL/SDK 查询，明确“成交笔数”，并移除架构图顶部大标题。四段 C++ 片段编译、3/3 相关回归、图文检查及同轮双 reviewer 独立审查完成；不改变产品 API 或既有里程碑状态。

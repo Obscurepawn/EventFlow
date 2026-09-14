@@ -27,9 +27,9 @@ Source: [cluster_client.hpp](../../../include/eventflow/cluster_client.hpp), [im
 
 `ClusterClientConfig` has timeout and request/response byte budgets. `ingest_attempts` defaults to 1; when increased, only eligible unconfirmed ingestion failures retry, using identical serialized bytes. Other mutations are sent once. A transport failure or UnknownCommit is ambiguous: reconcile the original operation; changing its ID can duplicate effects.
 
-The application executable supplies a `ComputationModule` with `name`, `version` and `bind` to `database_main`. Its factory returns a complete `BoundComputation` and handles staged DDL. Coordinator and Compute bind the same application definition; SDK `deploy()` does not upload it. The generic default module is SQL-only; the standalone streaming executable installs its own `streaming_market` module.
+The application executable supplies a `ComputationModule` with `name`, `version` and `bind` to `database_main`. Its factory returns a complete `BoundComputation` and handles staged DDL. Coordinator and Compute bind the same application definition; SDK `deploy()` does not upload it. The generic default module is SQL-only; the standalone streaming executable installs its own `streaming_news` module.
 
-The complete example defines `trades(ticker: String, trade_id: Int64, volume: Int64)`, followed by `trade_totals` and `market_features`. Read the deployed Catalog instead of assuming a fixture schema. There is no `submit_job()` / `unregister()` API, remote callback upload or online graph migration. Startup DDL can add supported MVs, but cannot dynamically register a C++ guard.
+The complete example defines `news_updates(ticker: String, timestamp_us: Int64, headline: String, text_body: String, sentiment_score: Float64, market_price: Float64)`, followed by `news_stats` and `news_features`. Read the deployed Catalog instead of assuming a fixture schema. There is no `submit_job()` / `unregister()` API, remote callback upload or online graph migration. Startup DDL can add supported MVs, but cannot dynamically register a C++ guard.
 
 ## HTTP/JSON equivalent
 

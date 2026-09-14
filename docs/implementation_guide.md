@@ -1,6 +1,6 @@
 # EventFlow 实现导读：从 SQL、状态与触发到异步特征结果
 
-以[成交评分示例](../examples/streaming_database/README.md)为主线：生产者将成交写入独立消息服务，EventFlow 主动消费，更新成交统计和级联特征；条件或 Clock 触发请求后，系统固定本次计算需要的输入，由后台函数计算并发布结果。后来的成交不会改写旧请求的输入。本文也用局部新闻 Pattern 和多目标 DAG 片段解释通用机制；它们不是示例中额外安装的业务图。
+以[新闻影响指标示例](../examples/streaming_database/README.md)为主线：生产者将六字段新闻写入独立消息服务，EventFlow 主动消费，更新新闻统计和级联特征；条件或 Clock 触发请求后，系统固定本次计算需要的输入，由后台函数计算并发布结果。后来的新闻不会改写旧请求的输入。本文也用局部新闻 Pattern 和多目标 DAG 片段解释通用机制；它们不是示例中额外安装的业务图。
 
 Catalog 记录表、视图和函数之间的依赖；物化视图（MV）保存随输入更新的查询结果。Trigger 声明触发条件，Pattern 声明多条事件的匹配顺序，Latest 保存当前选中的成功请求结果。多个 Compute 进程处理不同业务分片，状态共同存放在独立的键值存储服务（KV Service）中。每个分片只由一个执行者（owner）推进状态，并由它原子发布相应结果与 Latest。
 
@@ -68,11 +68,11 @@ KV listens
 
 ### 独立定义与服务装配
 
-[definition.cpp](../examples/streaming_database/definition.cpp)先定义 `trades -> trade_totals -> market_features`，然后定义 session、阈值 Trigger 和周期 Trigger。`capture_current` 将总量、笔数和两倍总量固定给评分函数，最后调用 `TriggerSet::bind`。示例工厂接收 `staged_ddl`，在绑定 Trigger 前应用它们；工厂失败时不发布部分定义。
+[definition.cpp](../examples/streaming_database/definition.cpp)先定义 `news_updates -> news_stats -> news_features`，然后定义 session、阈值 Trigger 和周期 Trigger。`capture_current` 将新闻条数、平均情绪和情绪价格乘积合计固定给影响指标函数，最后调用 `TriggerSet::bind`。示例工厂接收 `staged_ddl`，在绑定 Trigger 前应用它们；工厂失败时不发布部分定义。
 
 ```cpp
 ComputationModule computation_module() noexcept {
-  return {.name = "streaming_market", .version = 1, .bind = &bind_definition};
+  return {.name = "streaming_news", .version = 1, .bind = &bind_definition};
 }
 ```
 
@@ -90,13 +90,13 @@ C++ 编译检查静态函数输入输出与 `noexcept`；bind 检查实际 Schem
 
 ### 客户端只生产、部署并查询
 
-完整流程见 [verify.cpp](../examples/streaming_database/verify.cpp)：先 publish 成交到独立消息服务，确认 STAGING 未消费，再 `deploy()`；数据库自行消费并更新结果。验证器的等待循环仅查询 SQL/消息确认位置，不调用数据库 ingest/pump/drain。
+完整流程见 [verify.cpp](../examples/streaming_database/verify.cpp)：先 publish 新闻到独立消息服务，确认 STAGING 未消费，再 `deploy()`；数据库自行消费并更新结果。验证器的等待循环仅查询 SQL/消息确认位置，不调用数据库 ingest/pump/drain。
 
 ```cpp
-Status query_trade_volume() noexcept {
+Status query_news_features() noexcept {
   EF_ASSIGN_OR_RETURN(auto client, ClusterClient::open("http://127.0.0.1:8080"));
   EF_ASSIGN_OR_RETURN(auto result, client->query(
-      "SELECT total_volume,trade_count,doubled_volume FROM market_features",
+      "SELECT news_count,average_sentiment,sentiment_price_sum FROM news_features",
       Row{std::string("TICKER_0")}));
   return {};
 }
@@ -260,7 +260,7 @@ lookup join 收集两边变化涉及的业务 scope，对同一个 scope 分别�
 
 ### 字段表达式读取本轮稳定 MV
 
-下面假设 `news` 是包含 `sentiment_score` 列的新闻表 ID；`ready` 是按业务 key 唯一定位的物化视图 ID，视图中有 Bool 类型的 `ready` 列。`event` 表示当前新闻事件，`ready_now` 读取当前视图中的条件值。这是说明表达式的局部片段；当前完整建表、绑定和运行入口见[成交示例](../examples/streaming_database/definition.cpp)。
+下面假设 `news` 是包含 `sentiment_score` 列的新闻表 ID；`ready` 是按业务 key 唯一定位的物化视图 ID，视图中有 Bool 类型的 `ready` 列。`event` 表示当前新闻事件，`ready_now` 读取当前视图中的条件值。这是说明表达式的局部片段；当前完整建表、绑定和运行入口见[新闻示例](../examples/streaming_database/definition.cpp)。
 
 ```cpp
 const auto event = EventRef::source({.kind = "news", .payload_relation = news});
@@ -278,11 +278,11 @@ const auto rule = Trigger::on_event("ready_positive_news", event)
 
 基表写入与事件 payload 是独立字段：`ProcessorEvent.changes` 不自动证明 `values` 正确。调用方可用 `encode_typed(news)` 编码，但仍需显式填入 `source`、`scope`、`kind`、`values` 与 TableChange。原始行不会因为声明了 `payload_relation` 就被直接强转成业务 struct。
 
-当前成交示例在 [definition.cpp](../examples/streaming_database/definition.cpp)中直接声明读取自己定义的级联 MV：
+当前新闻示例在 [definition.cpp](../examples/streaming_database/definition.cpp)中直接声明读取自己定义的级联 MV：
 
 ```text
-trades -> trade_totals -> market_features(total_volume, trade_count, doubled_volume)
-trade event + active session + total_volume >= 100 -> volume_threshold
+news_updates -> news_stats -> news_features(news_count, average_sentiment, sentiment_price_sum)
+news event + active session + news_count >= 2 + average_sentiment >= 0.5 -> sentiment_threshold
 ```
 
 读取 MV 不等于订阅其每次变化。完整通用 `on_change` / `on_request_terminal` host 仍未接入集群 SDK；[observation_definition.hpp](../include/eventflow/observation_definition.hpp) 与私有 observer 提供基础，没有引入通用 CDC 服务或持久事件观察队列。
@@ -369,7 +369,7 @@ const auto session = SessionRef::candidate(candidate);
 
 一次公开操作固定一个 now，不在不同回调里重读墙钟。[TimerQueue](../src/runtime/time.cpp)处理到期顺序、generation、周期和 skipped slots。到期先于同刻新输入；延迟 guard 读取执行时的稳定状态，原 scheduled time 只是审计事实。相对 Timer 从实际执行 now 起算，不伪造过去的 MV 快照。
 
-当前[完整示例](../examples/streaming_database/README.md)使用 Coordinator 的 `tick_interval_ms=20` 自动推进已安装的 Clock，同时配置 `source.poll_interval_ms=10` 主动读取成交。客户端无需调用 drain。没有 source 输入仍能处理 TTL/候选过期。周期按已经观察到的 scope 激活，不补激活前历史，错过时隙合并并记录 skipped。builder 自身没有定时线程。
+当前[完整示例](../examples/streaming_database/README.md)使用 Coordinator 的 `tick_interval_ms=20` 自动推进已安装的 Clock，同时配置 `source.poll_interval_ms=10` 主动读取新闻。客户端无需调用 drain。没有 source 输入仍能处理 TTL/候选过期。周期按已经观察到的 scope 激活，不补激活前历史，错过时隙合并并记录 skipped。builder 自身没有定时线程。
 
 ### 内置触发审计表
 
@@ -511,7 +511,7 @@ expiry fence -> completion/cancel/request timeout/admission -> ordinary timers
 
 ### 同一请求中的共享计算
 
-通用 RequestMachine 也支持多目标请求；例如下面的函数依赖图用来说明共享祖先，它不是成交示例额外安装的业务图：
+通用 RequestMachine 也支持多目标请求；例如下面的函数依赖图用来说明共享祖先，它不是新闻示例额外安装的业务图：
 
 ```text
 quote_capture -> market_sql --+
@@ -540,31 +540,31 @@ LatestView 显式依赖结果关系、RequestStatus 和 Candidate 三者。候�
 
 [Engine::latest_view](../src/runtime/engine.cpp)通过变化涉及的 scope 和 request identity 点读结果/status，同时维护 selector state 与公开行，并检查两者 provenance 一致。它不是每次完成都扫描全部历史请求重新做 arg-max。
 
-## 10. 一条完整轨迹：成交触发一次固定评分
+## 10. 一条完整轨迹：新闻触发一次固定影响指标计算
 
-[成交示例](../examples/streaming_database/README.md)是这条轨迹的完整入口：
+[新闻示例](../examples/streaming_database/README.md)是这条轨迹的完整入口：
 
 ```sh
 bash examples/streaming_database/run.sh
 ```
 
-以其中一个 ticker 为例，先向消息服务写入成交量 70 和 50。部署前消息不被确认；部署后数据库主动消费。第二条成交将总量从 70 推到 120，触发阈值请求：
+以其中一个 ticker 为例，先向消息服务写入两条新闻，情绪/价格分别为 0.25/100 和 0.75/104。部署前消息不被确认；部署后数据库主动消费。第二条新闻使条数达到 2、平均情绪达到 0.5，触发阈值请求：
 
 | 步骤 | 执行者 | 状态变化 |
 | --- | --- | --- |
 | 1 | producer | 向独立 HTTP 消息服务 publish 业务 JSON，获取 source offset |
 | 2 | Coordinator / SourcePoller | poll 一条原投递，固定内容、token 与处理时间，按目标表 Schema 解码 |
 | 3 | Coordinator | 计算 shard，保存原 pending 投递，转发到该 key 的 Compute |
-| 4 | Compute / Engine | 写入 trades，更新 trade_totals 与 market_features；总量 120、笔数 2、两倍总量 240 |
-| 5 | EventProcessor | 在本轮稳定 MV 上判断 total_volume >= 100，保存 Trigger/intent；关系、生命周期和源进度同 owner 提交 |
+| 4 | Compute / Engine | 写入 news_updates，更新 news_stats 与 news_features；条数 2、平均情绪 0.5、乘积合计 103 |
+| 5 | EventProcessor | 在本轮稳定 MV 上判断 news_count >= 2 且 average_sentiment >= 0.5，保存 Trigger/intent；关系、生命周期和源进度同 owner 提交 |
 | 6 | Coordinator / SourcePoller | 输入确认后推进源前缀并 ACK；模型完成不作为输入 ACK 的前提 |
-| 7 | 请求受理 | 在已确认版本读取 120/2/240，写入固定捕获行、请求状态与 once 消耗 |
-| 8 | ComputationRuntime / worker | owner 持久 claim，worker 计算 240+2=242，completion 由 owner 确认 |
-| 9 | SQL client | 查询 MV、捕获与 Latest，核对实际 node/shard 和请求身份 |
+| 7 | 请求受理 | 在已确认版本读取 2/0.5/103，写入固定捕获行、请求状态与 once 消耗 |
+| 8 | ComputationRuntime / worker | owner 持久 claim，worker 计算 103/2=51.5，completion 由 owner 确认 |
+| 9 | SQL client | 查询 MV、捕获与 Latest，断言 shard、打印 node_id，并核对请求身份 |
 
-客户端随后暂停集群并追加成交量 30。暂停期间源位置和 MV 不变；resume 后数据库自动消费，总量变成 150、笔数 3。旧阈值请求的 once 已消耗，输入仍为 120/2/240、评分仍为 242；新周期请求重新捕获当前 MV，评分为 300+3=303。
+客户端随后暂停集群并追加情绪 0.5、价格 112 的第三条新闻。暂停期间源位置和 MV 不变；resume 后数据库自动消费，条数变为 3、平均情绪仍为 0.5、乘积合计变为 159。旧阈值请求的 once 已消耗，输入仍为 2/0.5/103、指标仍为 51.5；新周期请求重新捕获当前 MV，指标为 159/3=53。
 
-完整[定义](../examples/streaming_database/definition.cpp)同时展示阈值 Trigger 与 Clock 的声明，完整[验证器](../examples/streaming_database/verify.cpp)检查两条不同 shard 的链路。循环中没有客户端 ingest/pump/drain。该例的预期数值并非本轮执行通过记录，验收证据见[当前规格](../specs/streaming-database-example.md)。
+完整[定义](../examples/streaming_database/definition.cpp)同时展示阈值 Trigger 与 Clock 的声明，完整[验证器](../examples/streaming_database/verify.cpp)检查两条不同 shard 的链路。循环中没有客户端 ingest/pump/drain。该例的预期数值并非本轮执行通过记录，验收证据见[当前规格](../specs/news-streaming-example.md)。
 
 ## 11. 缓存、存储提交与 UNKNOWN
 

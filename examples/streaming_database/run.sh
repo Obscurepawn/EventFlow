@@ -124,7 +124,7 @@ a_port=$ready_port
 launch EVENTFLOW_COMPUTE_READY compute-b "$database_bin" compute --config "$work_dir/compute-b.json"
 b_port=$ready_port
 cat >"$work_dir/meta.json" <<JSON
-{"cluster_id":"streaming-market","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"tick_interval_ms":20,"nodes":[{"node_id":"compute-a","endpoint":"http://127.0.0.1:$a_port","shards":[0]},{"node_id":"compute-b","endpoint":"http://127.0.0.1:$b_port","shards":[1]}],"source":{"type":"http","endpoint":"http://127.0.0.1:$source_port","source_id":"market_feed","relation":"trades","assignments":[{"topic":"trades","partition":0,"next_offset":"0"},{"topic":"trades","partition":1,"next_offset":"0"}],"poll_interval_ms":10,"max_message_bytes":262144}}
+{"cluster_id":"streaming-news","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"tick_interval_ms":20,"nodes":[{"node_id":"compute-a","endpoint":"http://127.0.0.1:$a_port","shards":[0]},{"node_id":"compute-b","endpoint":"http://127.0.0.1:$b_port","shards":[1]}],"source":{"type":"http","endpoint":"http://127.0.0.1:$source_port","source_id":"news_feed","relation":"news_updates","assignments":[{"topic":"news_updates","partition":0,"next_offset":"0"},{"topic":"news_updates","partition":1,"next_offset":"0"}],"poll_interval_ms":10,"max_message_bytes":262144}}
 JSON
 launch EVENTFLOW_COORDINATOR_READY meta "$database_bin" coordinator --config "$work_dir/meta.json"
 meta_port=$ready_port

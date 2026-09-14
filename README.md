@@ -68,68 +68,71 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 
 ### 先看示例：数据 Schema、业务 case 与计算图
 
-#### 输入数据：一行是一笔成交
+#### 输入数据：一行是一条新闻更新
 
-这个 demo 按股票代码 `ticker` 持续接收成交记录，输入表为 `trades`：
+这个 demo 按金融标的 `ticker` 接收新闻更新，输入表为 `news_updates`，包含以下六个非空字段：
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `ticker` | `STRING NOT NULL` | 股票代码，也是分区键；同一股票的特征在同一个 key 下维护 |
-| `trade_id` | `INT64 NOT NULL` | 该股票下的成交编号，与 `ticker` 一起构成主键 |
-| `volume` | `INT64 NOT NULL` | 这一笔成交的成交量 |
+| `ticker` | `STRING NOT NULL` | 金融标的代码，对应 Ticker，也是业务分区键 |
+| `timestamp_us` | `INT64 NOT NULL` | 新闻发生时间，对应 Timestamp，使用 Unix 微秒 |
+| `headline` | `STRING NOT NULL` | 新闻标题，对应 Headline |
+| `text_body` | `STRING NOT NULL` | 完整新闻正文，对应 Text Body |
+| `sentiment_score` | `FLOAT64 NOT NULL` | 已预先给定的情绪分数，对应 Sentiment Score |
+| `market_price` | `FLOAT64 NOT NULL` | 该条新闻发生时的市场价格，对应 Market Price |
 
-主键为 `(ticker, trade_id)`，分区键为 `ticker`。两条不同 `trade_id` 的记录表示两笔成交；`COUNT(*)` 统计成交笔数，`SUM(volume)` 统计累计成交量。
+本例用 `(ticker, timestamp_us)` 作为主键，假设同一标的同一微秒对应同一条新闻；相同业务键的后续输入更新该行。分区键为 `ticker`，`news_count` 统计表内新闻条数。标题和正文原样保存、可用 SQL 读取；特征计算直接使用预赋值情绪。新闻时间属于业务数据，Clock 按数据库处理时间调度，新闻采样价格只表示各条新闻发生时的价格。
 
-#### 业务 case：维护成交特征，按条件或周期计算评分
+#### 业务 case：维护新闻情绪特征，按条件或周期计算影响指标
 
-假设我们要为每只股票维护三个特征：累计成交量 `total_volume`、成交笔数 `trade_count`，以及两倍累计成交量 `doubled_volume`。前两项由 `trade_totals` 聚合产生，第三项由级联的 `market_features` 计算；每次成交输入都会更新这些物化特征。
+我们为每个标的维护新闻条数 `news_count`、平均情绪 `average_sentiment`，以及情绪与新闻时点价格乘积的合计 `sentiment_price_sum`。第一层 `news_stats` 计算新闻条数、情绪总和及 `SUM(sentiment_score * market_price)`；第二层 `news_features` 再由情绪总和除以新闻条数，得到平均情绪。
 
-在这些特征之上，再按两种规则计算评分 `score = doubled_volume + trade_count`。这个简单公式用于演示自定义函数计算：
+静态函数随后计算演示用的新闻影响指标 **`impact_score = sentiment_price_sum / news_count`**，即逐条新闻的“情绪分数 × 当时价格”的平均值：
 
-- **阈值评分 `volume_threshold`**：成交事件到来后，更新后的累计成交量 `>= 100`，且该股票的交易会话有效、该会话尚未受理过此规则的请求时，发起一次评分。受理时固定输入，同一会话最多受理一次。
-- **周期评分 `periodic_score`**：为已出现的股票每 `200 ms` 安排一个时钟时隙；会话有效时尝试按当前特征发起评分，输入未就绪则跳过。它与阈值规则独立，不需要先完成阈值评分；延迟的时隙可能合并。
+- **情绪阈值 `sentiment_threshold`**：新闻到来后，表内至少有 `2` 条新闻、平均情绪 `>= 0.5`，且该标的的新闻会话有效、该会话尚未受理此规则的请求时，发起一次计算。受理时固定输入，同一会话最多受理一次。
+- **周期计算 `periodic_impact`**：为已出现的标的每 `200 ms` 安排一个时隙；会话有效时按当前特征尝试发起计算，输入未就绪则跳过。它独立于情绪阈值规则，延迟时隙可能合并。
 
-例如，同一股票在同一会话内依次出现三笔成交：
+例如，同一标的在同一会话内收到三条时间戳不同的新闻：
 
-| 新成交的 `trade_id / volume` | 当前特征：累计成交量 / 成交笔数 / 两倍累计成交量 | 阈值评分 | 后续周期评分成功时 |
-| --- | --- | --- | --- |
-| `1 / 70` | `70 / 1 / 140` | 未达到阈值 | 若捕获此时输入，评分为 `141` |
-| `2 / 50` | `120 / 2 / 240` | 首次满足条件；若此时受理，评分为 `242` | 若捕获此时输入，评分为 `242` |
-| `3 / 30` | `150 / 3 / 300` | 前次已受理，保持其固定输入和评分 `242` | 捕获更新后输入，评分为 `303` |
+| 新闻 | 情绪分数 / 当时价格 | 当前特征：条数 / 平均情绪 / 情绪价格乘积合计 | 阈值计算 | 后续周期计算成功时 |
+| --- | --- | --- | --- | --- |
+| 产品前景改善 | `0.25 / 100` | `1 / 0.25 / 25` | 条数和情绪条件未满足 | 若捕获此时输入，指标为 `25` |
+| 盈利超出预期 | `0.75 / 104` | `2 / 0.5 / 103` | 首次满足条件；若此时受理，指标为 `51.5` | 若捕获此时输入，指标为 `51.5` |
+| 公布新客户合同 | `0.5 / 112` | `3 / 0.5 / 159` | 前次已受理，固定输入和指标仍为 `51.5` | 捕获更新后输入，指标为 `53` |
 
-这条时间线假定第二笔成交后的阈值请求已受理，才追加第三笔成交，与示例验证器的流程一致。周期请求读取各自受理时的特征，不保证每个中间状态都产生评分。
+时间线假定第二条新闻后的阈值请求已受理，才追加第三条，与验证器流程一致。周期请求使用各自受理时的特征，不保证每个中间状态都产生结果。验证器还为另一 shard 的标的输入 `(0.5, 200)`、`(0.75, 208)`，检查其独立结果为 `128`。
 
 #### 在同一张 DAG 上看特征依赖和触发目标
 
-**实线表示数据依赖，虚线表示事件、条件或请求激活。** 蓝色节点表示输入和持续维护的物化特征，紫色节点决定何时发起请求，绿色节点是 Trigger 最终触发的 `trade_score` 特征计算。
+**实线表示数据依赖，虚线表示事件、条件或请求激活。** 蓝色节点表示输入和持续维护的物化特征，紫色节点决定何时发起请求，绿色节点是 Trigger 最终触发的 `news_impact` 特征计算。
 
 ```mermaid
 flowchart TB
     subgraph live_features[" "]
-        trades["trades<br/>ticker, trade_id, volume"]
-        totals["trade_totals - MV<br/>total_volume = SUM(volume)<br/>trade_count = COUNT(*)"]
-        features["market_features - MV<br/>doubled_volume = total_volume * 2"]
-        trades --> totals --> features
+        news["news_updates<br/>ticker, timestamp_us, headline, text_body<br/>sentiment_score, market_price"]
+        totals["news_stats - MV<br/>news_count, total_sentiment<br/>SUM(sentiment_score * market_price)"]
+        features["news_features - MV<br/>news_count, average_sentiment<br/>sentiment_price_sum"]
+        news --> totals --> features
     end
-    session["trading_session<br/>Opened by the first trade per ticker"]
+    session["news_session<br/>Opened by the first news per ticker"]
     subgraph threshold_job[" "]
-        threshold["volume_threshold<br/>Trade event AND total_volume >= 100<br/>Active session AND not yet admitted"]
-        threshold_input["threshold_score_request<br/>capture_current at admission<br/>Frozen FeatureSnapshot"]
-        threshold_score["trade_score / calculate_score<br/>score = doubled_volume + trade_count<br/>Result for the threshold request"]
+        threshold["sentiment_threshold<br/>News event; news_count >= 2<br/>average_sentiment >= 0.5<br/>Active session; not yet admitted"]
+        threshold_input["threshold_impact_request<br/>capture_current at admission<br/>Frozen NewsFeatureSnapshot"]
+        threshold_score["news_impact / calculate_news_impact<br/>impact_score = sentiment_price_sum<br/>/ news_count<br/>Result for the threshold request"]
         threshold -. "Wait / once per session" .-> threshold_input
         threshold_input --> threshold_score
     end
     subgraph periodic_job[" "]
-        periodic["periodic_score<br/>200 ms Clock AND active session<br/>Independent of the threshold rule"]
-        periodic_input["periodic_score_request<br/>capture_current at admission<br/>Frozen FeatureSnapshot"]
-        periodic_score["trade_score / calculate_score<br/>score = doubled_volume + trade_count<br/>Result for each periodic request"]
+        periodic["periodic_impact<br/>200 ms Clock AND active session<br/>Independent of the threshold rule"]
+        periodic_input["periodic_impact_request<br/>capture_current at admission<br/>Frozen NewsFeatureSnapshot"]
+        periodic_impact["news_impact / calculate_news_impact<br/>impact_score = sentiment_price_sum<br/>/ news_count<br/>Result for each periodic request"]
         periodic -. "TryOnceAtFiring" .-> periodic_input
-        periodic_input --> periodic_score
+        periodic_input --> periodic_impact
     end
 
-    trades -. "first trade" .-> session
-    trades -. "on_event: after MV update" .-> threshold
-    features -. "read total_volume" .-> threshold
+    news -. "first news" .-> session
+    news -. "on_event: after MV update" .-> threshold
+    features -. "read count and mean sentiment" .-> threshold
     session -. "session / once" .-> threshold
     session -. "active session" .-> periodic
     features -->|"read at admission"| threshold_input
@@ -138,13 +141,13 @@ flowchart TB
     classDef control fill:#f3e8ff,stroke:#9333ea,color:#3b0764;
     classDef snapshot fill:#fff7ed,stroke:#ea580c,color:#431407;
     classDef result fill:#ecfdf5,stroke:#16a34a,color:#14532d;
-    class trades,totals,features materialized;
+    class news,totals,features materialized;
     class session,threshold,periodic control;
     class threshold_input,periodic_input snapshot;
-    class threshold_score,periodic_score result;
+    class threshold_score,periodic_impact result;
 ```
 
-两条 Trigger 都触发同一个静态评分函数 `calculate_score`，但各自创建请求、固定输入并保存结果；图中两个绿色节点表示两类请求的独立计算。MV 随成交持续更新，评分函数在请求受理后执行。每次发出的触发还会记录到 `trigger_audit`，可用于后文的 SQL 查询；审计记录不依赖评分成功。
+两条 Trigger 都触发同一个静态计算函数 `calculate_news_impact`，但各自创建请求、固定输入并保存结果；图中两个绿色节点表示两类请求的独立计算。MV 随新闻持续更新，影响指标函数在请求受理后执行。每次发出的触发还会记录到 `trigger_audit`，可用于后文的 SQL 查询；审计记录不依赖评分成功。
 
 #### 为什么用 MV 表达计算依赖，用 CEP 表达事件触发
 
@@ -155,7 +158,7 @@ flowchart TB
 | **Feature Computation Graph** | 输入表、保存中间特征的 MV、目标函数计算 | 下游计算对上游结果的数据依赖 |
 | **Trigger State Graph** | 等待事件、部分匹配、匹配完成等状态 | 事件和条件驱动的状态转移，附带顺序和时间约束 |
 
-**特征计算图描述“一个特征由哪些数据算出来”。** 可以把 MV 理解为“数据库持续替你维护结果的一条查询”：查询的投影、筛选、聚合等表达式定义计算，`FROM` / `JOIN` 引用的上游关系定义依赖；后续 MV 再引用前面的 MV，就形成一张有向计算图。例如 `trades → trade_totals → market_features`，分别完成成交存储、聚合和派生特征。流式 MV 的增量维护机制让新数据沿依赖更新已有结果，中间特征也可以直接查询。这个做法与 RisingWave 的持续维护和级联 MV 模型一致，适合本例可用关系运算表达的特征。[RisingWave MV](https://docs.risingwave.com/sql/commands/sql-create-mv)
+**特征计算图描述“一个特征由哪些数据算出来”。** 可以把 MV 理解为“数据库持续替你维护结果的一条查询”：查询的投影、筛选、聚合等表达式定义计算，`FROM` / `JOIN` 引用的上游关系定义依赖；后续 MV 再引用前面的 MV，就形成一张有向计算图。例如 `news_updates → news_stats → news_features`，分别完成新闻存储、聚合和派生特征。流式 MV 的增量维护机制让新数据沿依赖更新已有结果，中间特征也可以直接查询。这个做法与 RisingWave 的持续维护和级联 MV 模型一致，适合本例可用关系运算表达的特征。[RisingWave MV](https://docs.risingwave.com/sql/commands/sql-create-mv)
 
 **事件依赖图描述“哪些事件、以什么顺序、满足什么条件后，才允许触发”。** CEP（Complex Event Processing，复杂事件处理）专门匹配这类事件模式：其状态机的节点代表等待事件、部分匹配和匹配完成等状态，边代表由事件及条件驱动的状态转移，再附加时间窗口。比如“先收到事件 A，再在 2 秒内收到满足条件的事件 B，就触发计算”，运行时需要记住 A 已出现、接下来等待 B，以及何时超时；这些等待和转移可以用状态机表达，模式匹配完成后发出触发。这样的状态图可以包含循环，本身不要求是 DAG。Flink CEP 的事件条件、顺序匹配和 `within` 窗口就是这样的抽象。[Flink CEP](https://nightlies.apache.org/flink/flink-docs-release-1.19/docs/libs/cep/)
 
@@ -182,98 +185,99 @@ EventFlow 因此把两类规则接在一起：**MV 持续维护特征，Trigger 
 
 #### 1.1 用 SQL 定义物化视图
 
-下面沿用 [definition.cpp](examples/streaming_database/definition.cpp) 的成交示例。代码位于返回 `StatusOr<BoundComputation>` 的 `bind_definition(...) noexcept` 工厂内，使用 `eventflow` 命名空间；`EF_ASSIGN_OR_RETURN` 在失败时提前返回错误状态 `Status`（由工厂的 `StatusOr<T>` 承载），在成功时取得结果。
+下面沿用 [definition.cpp](examples/streaming_database/definition.cpp) 的新闻示例。代码位于返回 `StatusOr<BoundComputation>` 的 `bind_definition(...) noexcept` 工厂内，使用 `eventflow` 命名空间；`EF_ASSIGN_OR_RETURN` 在失败时提前返回错误状态 `Status`（由工厂的 `StatusOr<T>` 承载），在成功时取得结果。
 
 ```cpp
 EF_ASSIGN_OR_RETURN(auto catalog, Catalog::create());
-
-// Each trade has its own identity; all trades for one ticker share a partition.
-EF_ASSIGN_OR_RETURN(auto trades, catalog->define_sql(R"sql(
-  CREATE TABLE trades (
+// This example identifies an article by (ticker, timestamp_us); repeated keys
+// update that article. The payload keeps full text and microsecond news time.
+EF_ASSIGN_OR_RETURN(auto news, catalog->define_sql(R"sql(
+  CREATE TABLE news_updates (
     ticker STRING NOT NULL,
-    trade_id INT64 NOT NULL,
-    volume INT64 NOT NULL,
-    PRIMARY KEY (ticker, trade_id)
+    timestamp_us INT64 NOT NULL,
+    headline STRING NOT NULL,
+    text_body STRING NOT NULL,
+    sentiment_score FLOAT64 NOT NULL,
+    market_price FLOAT64 NOT NULL,
+    PRIMARY KEY (ticker, timestamp_us)
   ) PARTITION BY (ticker)
 )sql"));
-
-// First MV: maintain the total volume and trade count for each ticker.
-EF_ASSIGN_OR_RETURN(auto totals, catalog->define_sql(R"sql(
-  CREATE MATERIALIZED VIEW trade_totals AS
-    SELECT ticker, SUM(volume) AS total_volume, COUNT(*) AS trade_count
-    FROM trades GROUP BY ticker
+// First MV: aggregate sentiment and retain the sentiment/price pairing per article.
+EF_ASSIGN_OR_RETURN(auto stats, catalog->define_sql(R"sql(
+  CREATE MATERIALIZED VIEW news_stats AS
+    SELECT ticker, COUNT(*) AS news_count, SUM(sentiment_score) AS total_sentiment,
+           SUM(sentiment_score * market_price) AS sentiment_price_sum
+    FROM news_updates GROUP BY ticker
 )sql"));
-(void)totals;
-
-// Second MV: derive another feature from the first MV.
+(void)stats;
+// Second MV: derive mean sentiment from the current aggregate. COUNT is Int64,
+// so division explicitly casts it to Float64 instead of relying on coercion.
 EF_ASSIGN_OR_RETURN(auto features, catalog->define_sql(R"sql(
-  CREATE MATERIALIZED VIEW market_features AS
-    SELECT ticker, total_volume, trade_count, total_volume * 2 AS doubled_volume
-    FROM trade_totals
+  CREATE MATERIALIZED VIEW news_features AS
+    SELECT ticker, news_count,
+           total_sentiment / CAST(news_count AS FLOAT64) AS average_sentiment,
+           sentiment_price_sum
+    FROM news_stats
 )sql"));
 ```
 
-`define_sql` 把关系注册到 Catalog，返回供后续 API 引用的 `RelationId`。这里的依赖是 `trades → trade_totals → market_features`；部署后每条成交输入都会沿依赖更新两级 MV，用户无需手动刷新。例如同一 ticker 先后收到两条不同 `trade_id` 的成交记录，成交量分别为 `70` 和 `50`，当前特征就是累计成交量 `120`、成交笔数 `2`（即两笔成交）、两倍累计成交量 `240`。
+`define_sql` 把关系注册到 Catalog，返回供后续 API 引用的 `RelationId`。依赖为 `news_updates → news_stats → news_features`；每条新闻输入沿依赖更新两级 MV，用户无需手动刷新。`news_count` 是整数，因此平均值计算显式使用 `CAST(news_count AS FLOAT64)`。
 
 #### 1.2 用声明式 API 定义 Trigger
 
-下面的片段继续使用 `trades` 和 `features`。其中 `session` 是同一工厂通过 `Catalog::define_candidate` 定义的 `trading_session`；`ProcessorConfig::requests->candidate` 在首条成交时为该 ticker 激活会话。完整会话策略、类型和 `SchemaTraits` 映射见 [definition.cpp](examples/streaming_database/definition.cpp)。**调用 `.in_session(...)` 是引用已配置的会话，不会自行创建或续期会话。**
+下面的片段继续使用 `news` 和 `features`。其中 `session` 是同一工厂通过 `Catalog::define_candidate` 定义的 `news_session`；`ProcessorConfig::requests->candidate` 在首条新闻时为该 ticker 激活会话。完整会话策略、类型和 `SchemaTraits` 映射见 [definition.cpp](examples/streaming_database/definition.cpp)。**调用 `.in_session(...)` 是引用已配置的会话，不会自行创建或续期会话。**
 
-`capture_features` 将当前 MV 的累计成交量、成交笔数和两倍累计成交量映射为 `FeatureSnapshot`，并检查 SQL `SUM` 的可空值；`calculate_score` 是返回 `StatusOr<Score>` 的 `noexcept` C++ 函数，计算 `doubled_volume + trade_count`，包含整数溢出检查。以下把它声明为静态 `Function`：
+`capture_news_features` 将当前 MV 的新闻条数、平均情绪和情绪价格乘积合计映射为 `NewsFeatureSnapshot`，检查条数及 SQL 聚合列的可空值。`calculate_news_impact` 是返回 `StatusOr<NewsImpact>` 的 `noexcept` C++ 函数，计算 `sentiment_price_sum / news_count`，并检查分母和非有限结果。以下将它声明为静态 `Function`：
 
 ```cpp
 using namespace std::chrono_literals;
 
-const auto trade_event =
-    EventRef::source({.kind = "trades", .payload_relation = trades});
-const auto score_function =
-    Function<&calculate_score>{.id = "trade_score",
-                               .version = 1,
-                               .implementation_identity = "streaming.trade_score.v1"};
+const auto news_event = EventRef::source({.kind = "news_updates", .payload_relation = news});
+const auto impact_function = Function<&calculate_news_impact>{
+    .id = "news_impact", .version = 1, .implementation_identity = "streaming.news_impact.v1"};
 
-// Evaluate the updated MV after each trade for this ticker.
+// Evaluate the updated news features after each article for this ticker.
 const auto threshold =
-    Trigger::on_event("volume_threshold", trade_event)
-        .implementation_identity("streaming.volume_threshold.v1")
-        .when(ViewRef(features).column<std::int64_t>("total_volume") >= std::int64_t{100})
+    Trigger::on_event("sentiment_threshold", news_event)
+        .implementation_identity("streaming.sentiment_threshold.v1")
+        .when((ViewRef(features).column<std::int64_t>("news_count") >= std::int64_t{2}) &&
+              (ViewRef(features).column<double>("average_sentiment") >= 0.5))
         .in_session(SessionRef::candidate(session))
         // Freeze the current features when the request is admitted.
-        .capture_current<&capture_features>(features, "streaming.capture_features.v1")
-        .request(score_function,
-                 {.id = "threshold_score_request",
-                  .mode = RequestTriggerMode::Wait,
-                  .pending_for = 1s,
-                  .lifetime = 10s,
-                  .once_per_candidate = true});
+        .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
+        .request(impact_function, {.id = "threshold_impact_request",
+                                   .mode = RequestTriggerMode::Wait,
+                                   .pending_for = 1s,
+                                   .lifetime = 10s,
+                                   .once_per_candidate = true});
 
 // Database time drives one clock per observed ticker with an active session.
 const auto periodic =
-    Trigger::clock("periodic_score", {.policy_id = "market_score_clock",
-                                      .every = 200ms,
-                                      .phase = 0ms,
-                                      .event_kind = "market_clock"})
-        .implementation_identity("streaming.periodic_score.v1")
+    Trigger::clock("periodic_impact", {.policy_id = "news_impact_clock",
+                                       .every = 200ms,
+                                       .phase = 0ms,
+                                       .event_kind = "news_clock"})
+        .implementation_identity("streaming.periodic_impact.v1")
         .in_session(SessionRef::candidate(session))
-        .capture_current<&capture_features>(features, "streaming.capture_features.v1")
-        .request(score_function,
-                 {.id = "periodic_score_request",
-                  .mode = RequestTriggerMode::TryOnceAtFiring,
-                  .pending_for = 1s,
-                  .lifetime = 10s,
-                  .once_per_candidate = false});
+        .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
+        .request(impact_function, {.id = "periodic_impact_request",
+                                   .mode = RequestTriggerMode::TryOnceAtFiring,
+                                   .pending_for = 1s,
+                                   .lifetime = 10s,
+                                   .once_per_candidate = false});
 ```
 
 | 声明 | 在此例中的含义 |
 | --- | --- |
-| `on_event(...).when(...)` | 每条 `trades` 事件到来后，读取同 ticker 更新后的 MV，检查总量是否 `>= 100`；这是条件判断，不自动表示“从低于阈值穿越到高于阈值” |
+| `on_event(...).when(...)` | 每条 `news_updates` 事件后读取同 ticker 的 MV，检查新闻条数 `>= 2` 且平均情绪 `>= 0.5`；这是条件判断，不自动表示阈值穿越 |
 | `in_session(...)` | 将请求绑定到该 ticker 的活动业务会话，期限及换代由 candidate policy 管理 |
-| `capture_current(...)` | 在请求受理时读取并固定输入；若等待后才受理，读取的是那时的 MV，后续成交不会改写已固定的输入 |
+| `capture_current(...)` | 在请求受理时读取并固定输入；若等待后才受理，读取的是那时的 MV，后续新闻不会改写已固定的输入 |
 | `Wait` / `TryOnceAtFiring` | 前者可在 `pending_for` 内等待受理条件就绪；后者只尝试当前触发时隙，未就绪就跳过 |
 | `once_per_candidate` | `true` 表示同一会话中该 binding 最多受理一次；成功受理才消耗次数，计算随后失败也不会归还 |
 | `lifetime` | 请求受理后的执行期限，与等待受理的 `pending_for` 分开 |
 | `clock(..., .every = 200ms)` | 为已观察到的 key 安排周期时隙；活动会话允许时发起请求，过期时隙可能合并，不保证每 200 ms 完成一次计算 |
 
-上述阈值请求受理时若特征为 `120、2、240`，评分就是 `242`。再追加成交量 `30`，当前 MV 会变为 `150、3、300`，周期请求可以得到 `303`；已受理的阈值请求仍保留原输入和评分 `242`。
+上述阈值请求受理时的特征若为 `2、0.5、103`，影响指标就是 `51.5`。追加第三条新闻后，当前特征变为 `3、0.5、159`，周期请求可以得到 `53`；已受理的阈值请求仍保留原输入和 `51.5`。
 
 #### 1.3 统一绑定计算定义
 
@@ -284,8 +288,8 @@ EF_ASSIGN_OR_RETURN(auto snapshot, catalog->snapshot());
 
 // Bind the SQL graph, triggers, captures, functions and requests as one definition.
 // The protected trigger_audit relation is installed automatically.
-return TriggerSet::bind(std::move(snapshot), std::move(definition),
-                        {threshold, periodic}, {.shard_count = 2});
+return TriggerSet::bind(std::move(snapshot), std::move(definition), {threshold, periodic},
+                        {.shard_count = 2});
 ```
 
 绑定结果包含 Catalog、函数 Registry 和运行定义；`bound.explain()` 可查看规则及生成关系，列名、类型、scope 和引用冲突在启动绑定时以状态错误返回。应用通过 `ComputationModule` 提供这个工厂，再由 [main.cpp](examples/streaming_database/main.cpp) 将模块传给 `database_main`。
@@ -328,8 +332,8 @@ Compute 先按依赖更新基表和级联 MV，再检查相关 Trigger。符合�
 
 ```sql
 -- Read the current materialized features.
-SELECT total_volume, trade_count, doubled_volume
-  FROM market_features WHERE ticker='TICKER_0';
+SELECT news_count, average_sentiment, sentiment_price_sum
+  FROM news_features WHERE ticker='TICKER_0';
 
 -- List emitted triggers for one business key.
 SELECT occurrence_id, rule_id, event_kind, occurred_at_us, evaluated_at_us,
@@ -339,18 +343,18 @@ SELECT occurrence_id, rule_id, event_kind, occurred_at_us, evaluated_at_us,
 -- Inspect only the threshold rule, including the source message identity.
 SELECT occurrence_id, request_id, source_topic, source_partition, source_offset
   FROM trigger_audit
-  WHERE scope_key_0='TICKER_0' AND rule_id='volume_threshold';
+  WHERE scope_key_0='TICKER_0' AND rule_id='sentiment_threshold';
 
 -- Inspect periodic firings and coalesced clock slots.
 SELECT occurrence_id, scheduled_at_us, evaluated_at_us, skipped_slots, request_id
   FROM trigger_audit
-  WHERE scope_key_0='TICKER_0' AND rule_id='periodic_score';
+  WHERE scope_key_0='TICKER_0' AND rule_id='periodic_impact';
 ```
 
 | 字段 | 如何解读 |
 | --- | --- |
 | `occurrence_id` | 一次实际触发的稳定身份；同一规则的多次触发有不同身份 |
-| `rule_id` / `event_kind` | 例如 `volume_threshold` / `trades`，或 `periodic_score` / `market_clock` |
+| `rule_id` / `event_kind` | 例如 `sentiment_threshold` / `news_updates`，或 `periodic_impact` / `news_clock` |
 | `occurred_at_us` / `evaluated_at_us` | occurrence 的逻辑发生时间 / 实际评估时的 processing time，单位均为微秒；不是函数完成时间 |
 | `scheduled_at_us` / `skipped_slots` | Clock 的计划时隙 / 合并跳过的时隙数；普通 source 触发的计划时间为 NULL |
 | `request_id` / `binding_id` / `plan` | 关联请求身份、请求绑定及计算计划；未绑定请求的 Trigger 这些列为 NULL |
@@ -374,7 +378,8 @@ Status print_trigger_audit(std::string_view endpoint, const std::string& ticker)
   EF_ASSIGN_OR_RETURN(auto audit, client->query(R"sql(
     SELECT occurrence_id, rule_id, event_kind, occurred_at_us, request_id
       FROM trigger_audit
-  )sql", scope, 128, 1024 * 1024));
+  )sql",
+                                                scope, 128, 1024 * 1024));
 
   // SELECT column order is shared by audit.fields and each returned row.
   for (const auto& row : audit.rows) {
@@ -400,20 +405,38 @@ Status print_trigger_audit(std::string_view endpoint, const std::string& ticker)
 ## 系统结构
 
 <p align="center">
-  <a href="docs/image/eventflow_streaming_architecture.png"><img src="docs/image/eventflow_streaming_architecture.png" alt="EventFlow 的消息生产、数据库主动消费、分片计算与 SQL 查询" width="720"></a>
+  <img src="docs/image/eventflow-system-architecture.png" alt="EventFlow 系统架构：静态计算定义、消息拉取与确认、Coordinator、Compute 内部的 MV、Trigger、请求状态机、函数线程池、有界缓存及共享 KV" width="1100">
 </p>
 
-图中的 `SourcePoller` 通过 `IMessageSource` 主动读取消息系统中的数据，消息系统可以是 MQ，也可以是提供拉取接口的其他服务；查询流从客户端经 Coordinator 读取物化结果。当前完整示例使用 HTTP 消息服务。各组件的职责如下：
+图中的 `SourcePoller` 由 Coordinator 托管，通过 `IMessageSource` 主动拉取消息，输入持久确认后才 ACK；消息系统可以是 MQ，也可以是提供拉取接口的其他服务。当前完整示例使用 HTTP 消息服务。各 Compute 绑定并校验同一 `ComputationModule` 与 Catalog，分别负责不同 shard；图中展开 Compute A 的内部组件，Compute B 及其他实例具有相同结构。SQL 查询从客户端经 Coordinator 路由到对应 owner，读取已保存的物化结果。
 
 | 组件 | 职责 |
 | --- | --- |
 | 生产与查询客户端 | 向消息系统生产数据，通过 SQL 读取并检查结果 |
 | 消息系统（如 MQ） | 保存消息，提供读取、确认与重放位置；具体协议由 IMessageSource 适配 |
 | Coordinator / Meta | 安装 Catalog 与计算定义、管理路由，托管 SourcePoller，协调运行状态、水位和 checkpoint |
-| Compute | 按 shard 维护基表和 MV，检查 Trigger，固定请求输入并执行就绪函数 |
-| KV Service | 保存共享持久状态，提供原子提交、确认版本和存储快照 |
+| Compute / EventProcessor | 串行维护所属 shard 的基表、级联 MV、Trigger / CEP、会话、Timer 与触发审计 |
+| RequestRuntime / RequestMachine | 受理时固定输入，维护请求、节点、attempt 与 once 状态，推进依赖已经就绪的函数 |
+| 函数线程池 | 使用固定输入执行已编译函数，把完成结果返回同一 owner，由 owner 提交结果与后继状态 |
+| CachedStateStore / RemoteStateStore | CachedStateStore 在节点预算内缓存已确认状态，校验 owner / epoch，UNKNOWN 时保留原批次并阻止绕过确认；下层 RemoteStateStore 负责 HTTP KV 调用 |
+| KV Service | 保存各业务 shard 和控制 shard 的状态，提供原子批、revision / receipt 和存储快照；RocksDB 后端保留 WAL |
 
 源码中的嵌入式 C++ API 仍可供应用直接组合使用；完整示例展示的是独立部署的数据库服务。当前采用静态分片和已编译的计算定义，在线图迁移、动态扩展函数、Process Function 与 HA 继续保留为后续范围。
+
+### 消息处理、特征计算与 Trigger 状态维护
+
+<p align="center">
+  <img src="docs/image/eventflow-message-sequence.png" alt="消息处理时序：读取与路由、基表和级联 MV 更新、Trigger 状态推进、输入原子提交、请求受理、源 ACK、异步函数计算及结果提交" width="1100">
+</p>
+
+时序图按阶段展示消息处理与计算链路。`Compute owner`、`Trigger / CEP` 和函数执行器位于同一个 Compute 进程：前两者由同一 shard owner 协作维护状态，线程池只执行函数。读取当前视图、受理和领取任务涉及的细分 KV 往返作了合并；它们各自的提交边界仍然独立。图中把消息确认与后台计算分组展示；**当前实现的就绪成功路径先 submit，再返回输入确认并 ACK，ACK 无需等待函数完成。**
+
+1. **接收与更新特征**：保留消息的投递身份和处理时间，重投先去重；owner 先处理到期项，再更新基表与级联 MV。Trigger 使用本轮稳定的视图值检查条件，推进状态、会话、Timer 和待受理意图；实际发出的触发写入审计。
+2. **确认输入轮**：本轮关系变化、规则状态、Timer、触发记录与源进度同 shard 原子提交。遇到 `UNKNOWN`，保留原提交身份和完整批次，先确认结果再继续推进。
+3. **受理与执行请求**：满足就绪条件和额度后，受理轮保存固定输入、Request 和相关 once 状态；任务被持久领取并确认后才交给函数线程池。`capture_current` 在受理时读取特征，`capture_match` 保留匹配事件。条件不满足时不会发出触发；已经发出的请求意图可能按 `Wait` 等待，或按 `TryOnceAtFiring` 跳过。
+4. **ACK 与结果提交**：Coordinator 保存输入进度，SourcePoller 再确认原 token。**ACK 只依赖输入已确认，不要求后台函数已完成；就绪或额度不足也不会撤销已经确认的输入。** 完成结果返回 owner，再以独立原子轮提交结果、请求状态与后继就绪记录，供 SQL 查询。
+
+Clock / Timer 也能由数据库运行循环独立推进，不需要等待新消息；其时间域为 processing time。触发审计表示“已发出”，不能据此推断请求已受理或计算已成功。
 
 ## 使用 Coding Agent 快速接入
 
@@ -421,7 +444,7 @@ Reviewer 可以把 [EventFlow 使用 skill](.skills/use-eventflow/SKILL.md) 交�
 
 在 EventFlow 源码目录中，可以直接给 Coding Agent 下面这段提示词，再替换最后的业务需求：
 
-> 请先读取 `.skills/use-eventflow/SKILL.md` 和 `examples/streaming_database/README.md`，基于当前源码实现我的需求：按 ticker 汇总成交量，超过阈值时触发计算，并每五秒计算一次当前特征。请提供静态计算定义、数据库持续消费消息的部署方式、SQL 断言、运行命令和验证结果。
+> 请先读取 `.skills/use-eventflow/SKILL.md` 和 `examples/streaming_database/README.md`，基于当前源码实现我的需求：接收包含 ticker、timestamp_us、headline、text_body、sentiment_score、market_price 的新闻流，按 ticker 维护新闻情绪特征，条件满足时触发影响指标计算，并每五秒重算当前特征。请提供静态计算定义、数据库持续消费消息的部署方式、SQL 断言、运行命令和验证结果。
 
 `.skills/` 是本仓库提供的 skill 目录，各 Coding Agent 的自动发现规则可能不同。显式要求读取上述文件即可使用；支持本地 skill 加载的工具也可以加载 `.skills/use-eventflow/`。其中的 `agents/openai.yaml` 是可选元数据，普通 Markdown 入口不依赖特定工具。
 
@@ -504,16 +527,16 @@ eventflow-review demo all
 
 | 第三方库 | 版本 | 用途与带来的依赖 |
 | --- | --- | --- |
-| RocksDB | 8.9.1 | 持久化 KV；共享库依赖 GNU libstdc++、gflags 及下列五种压缩库 |
+| RocksDB | 8.9.1 | 持久化 KV；共享库依赖 GNU libstdc++、gflags 以及若干种压缩算法 |
 | ANTLR4 C++ runtime | 4.10 | 执行已生成的 SQL 解析器；共享库依赖 GNU libstdc++ |
 | nlohmann/json | 3.12.0 | JSON 编解码；单头文件，随项目编译，无单独共享库 |
-| cpp-httplib | 0.20.1 | HTTP 服务与客户端；单头文件，使用系统网络/线程设施；当前未开启其 OpenSSL、压缩功能宏 |
+| cpp-httplib | 0.20.1 | HTTP 服务与客户端；单头文件，使用系统网络/线程设施 |
 | librdkafka C / C++ | 2.3.0 | Kafka 消息源适配；项目链接 C 接口，依赖 SASL、OpenSSL、LZ4、Zstd、zlib；另附可选 C++ 接口库，后者还依赖 GNU libstdc++ |
 | GoogleTest | 1.14.0 | 预编译静态库；仅 `BUILD_TESTING=ON` 时由测试目标链接，使用 C++ 运行库与线程设施 |
 | gflags | 2.2.2 | RocksDB 的传递运行依赖；依赖 GNU libstdc++ |
 | Snappy / LZ4 / Zstandard / zlib / bzip2 | 1.1.10 / 1.9.4 / 1.5.5 / 1.3 / 1.0.8 | 压缩运行库；RocksDB 依赖全部五种，librdkafka 使用其中三种；Snappy 还依赖 GNU libstdc++ |
-| Cyrus SASL | 2.1.28 | librdkafka 的认证运行库；随包包含核心库，其依赖的 OpenSSL crypto 也已附带；额外认证机制插件不在本包中 |
-| OpenSSL SSL / crypto | 3.0.13 | librdkafka 的 TLS/加密及 SASL 的加密依赖；运行库已附带，连接实际 TLS broker 时仍需配置可信 CA/证书 |
+| Cyrus SASL | 2.1.28 | librdkafka 的认证运行库；随包包含核心库，其依赖的 OpenSSL crypto 也已附带 |
+| OpenSSL SSL / crypto | 3.0.13 | librdkafka 的 TLS/加密及 SASL 的加密依赖 |
 
 构建使用已生成的解析代码，**不下载第三方源码，也不需要 Java 或 ANTLR 生成器**；只有重新生成 SQL 解析器时才需要匹配的 ANTLR 4.10 生成工具及 Java。默认 MemMock 测试不需要 Kafka broker 或 Docker；真实 Kafka 集成仍为后续范围。
 

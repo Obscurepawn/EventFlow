@@ -1,50 +1,51 @@
 #include "definition.hpp"
 #include <chrono>
+#include <cmath>
 #include <limits>
 
 namespace eventflow::streaming_example {
 
-struct CurrentFeatures {
-  std::optional<std::int64_t> total_volume;
-  std::int64_t trade_count = 0;
-  std::optional<std::int64_t> doubled_volume;
+struct CurrentNewsFeatures {
+  std::int64_t news_count = 0;
+  std::optional<double> average_sentiment;
+  std::optional<double> sentiment_price_sum;
 };
 
-struct FeatureSnapshot {
-  std::int64_t total_volume = 0;
-  std::int64_t trade_count = 0;
-  std::int64_t doubled_volume = 0;
+struct NewsFeatureSnapshot {
+  std::int64_t news_count = 0;
+  double average_sentiment = 0.0;
+  double sentiment_price_sum = 0.0;
 };
 
-struct Score {
-  std::int64_t score = 0;
+struct NewsImpact {
+  double impact_score = 0.0;
 };
 
 } // namespace eventflow::streaming_example
 
 namespace eventflow {
 
-template <> struct SchemaTraits<streaming_example::CurrentFeatures> {
+template <> struct SchemaTraits<streaming_example::CurrentNewsFeatures> {
   static auto fields() noexcept {
-    using streaming_example::CurrentFeatures;
-    return std::make_tuple(field<&CurrentFeatures::total_volume>("total_volume"),
-                           field<&CurrentFeatures::trade_count>("trade_count"),
-                           field<&CurrentFeatures::doubled_volume>("doubled_volume"));
+    using streaming_example::CurrentNewsFeatures;
+    return std::make_tuple(field<&CurrentNewsFeatures::news_count>("news_count"),
+                           field<&CurrentNewsFeatures::average_sentiment>("average_sentiment"),
+                           field<&CurrentNewsFeatures::sentiment_price_sum>("sentiment_price_sum"));
   }
 };
 
-template <> struct SchemaTraits<streaming_example::FeatureSnapshot> {
+template <> struct SchemaTraits<streaming_example::NewsFeatureSnapshot> {
   static auto fields() noexcept {
-    using streaming_example::FeatureSnapshot;
-    return std::make_tuple(field<&FeatureSnapshot::total_volume>("total_volume"),
-                           field<&FeatureSnapshot::trade_count>("trade_count"),
-                           field<&FeatureSnapshot::doubled_volume>("doubled_volume"));
+    using streaming_example::NewsFeatureSnapshot;
+    return std::make_tuple(field<&NewsFeatureSnapshot::news_count>("news_count"),
+                           field<&NewsFeatureSnapshot::average_sentiment>("average_sentiment"),
+                           field<&NewsFeatureSnapshot::sentiment_price_sum>("sentiment_price_sum"));
   }
 };
 
-template <> struct SchemaTraits<streaming_example::Score> {
+template <> struct SchemaTraits<streaming_example::NewsImpact> {
   static auto fields() noexcept {
-    return std::make_tuple(field<&streaming_example::Score::score>("score"));
+    return std::make_tuple(field<&streaming_example::NewsImpact::impact_score>("impact_score"));
   }
 };
 
@@ -53,47 +54,58 @@ template <> struct SchemaTraits<streaming_example::Score> {
 namespace eventflow::streaming_example {
 namespace {
 
-StatusOr<FeatureSnapshot> capture_features(const CurrentFeatures& current) noexcept {
-  // SQL SUM is nullable in its schema; this trade group must have concrete values.
-  if (!current.total_volume || !current.doubled_volume)
-    return Status(ErrorCode::FailedPrecondition, "trade aggregate has no volume");
-  return FeatureSnapshot{.total_volume = *current.total_volume,
-                         .trade_count = current.trade_count,
-                         .doubled_volume = *current.doubled_volume};
+StatusOr<NewsFeatureSnapshot> capture_news_features(const CurrentNewsFeatures& current) noexcept {
+  // SQL aggregate-derived columns are nullable; a usable news group needs values.
+  if (current.news_count <= 0 || !current.average_sentiment || !current.sentiment_price_sum)
+    return Status(ErrorCode::FailedPrecondition, "news aggregate has no usable features");
+  return NewsFeatureSnapshot{.news_count = current.news_count,
+                             .average_sentiment = *current.average_sentiment,
+                             .sentiment_price_sum = *current.sentiment_price_sum};
 }
 
-StatusOr<Score> calculate_score(const FeatureSnapshot& input) noexcept {
-  // A small deterministic business function makes every captured result auditable.
-  std::int64_t score = 0;
-  if (__builtin_add_overflow(input.doubled_volume, input.trade_count, &score))
-    return Status(ErrorCode::InvalidArgument, "trade score overflows Int64");
-  return Score{.score = score};
+StatusOr<NewsImpact> calculate_news_impact(const NewsFeatureSnapshot& input) noexcept {
+  // Use each article's pre-assigned sentiment and contemporaneous market price.
+  // This deterministic indicator demonstrates static computation, not text inference.
+  if (input.news_count <= 0)
+    return Status(ErrorCode::InvalidArgument, "news impact requires a positive news count");
+  const double impact = input.sentiment_price_sum / static_cast<double>(input.news_count);
+  if (!std::isfinite(impact))
+    return Status(ErrorCode::InvalidArgument, "news impact is not finite");
+  return NewsImpact{.impact_score = impact};
 }
 
 StatusOr<BoundComputation> bind_definition(const std::vector<std::string>& staged_ddl) noexcept {
   using namespace std::chrono_literals;
   EF_ASSIGN_OR_RETURN(auto catalog, Catalog::create());
-  // trade_id preserves individual trades; ticker owns their partition and aggregate.
-  EF_ASSIGN_OR_RETURN(auto trades, catalog->define_sql(R"sql(
-    CREATE TABLE trades (
+  // This example identifies an article by (ticker, timestamp_us); repeated keys
+  // update that article. The payload keeps full text and microsecond news time.
+  EF_ASSIGN_OR_RETURN(auto news, catalog->define_sql(R"sql(
+    CREATE TABLE news_updates (
       ticker STRING NOT NULL,
-      trade_id INT64 NOT NULL,
-      volume INT64 NOT NULL,
-      PRIMARY KEY (ticker, trade_id)
+      timestamp_us INT64 NOT NULL,
+      headline STRING NOT NULL,
+      text_body STRING NOT NULL,
+      sentiment_score FLOAT64 NOT NULL,
+      market_price FLOAT64 NOT NULL,
+      PRIMARY KEY (ticker, timestamp_us)
     ) PARTITION BY (ticker)
   )sql"));
-  // First MV: maintain each ticker's total and count as trades are committed.
-  EF_ASSIGN_OR_RETURN(auto totals, catalog->define_sql(R"sql(
-    CREATE MATERIALIZED VIEW trade_totals AS
-      SELECT ticker, SUM(volume) AS total_volume, COUNT(*) AS trade_count
-      FROM trades GROUP BY ticker
+  // First MV: aggregate sentiment and retain the sentiment/price pairing per article.
+  EF_ASSIGN_OR_RETURN(auto stats, catalog->define_sql(R"sql(
+    CREATE MATERIALIZED VIEW news_stats AS
+      SELECT ticker, COUNT(*) AS news_count, SUM(sentiment_score) AS total_sentiment,
+             SUM(sentiment_score * market_price) AS sentiment_price_sum
+      FROM news_updates GROUP BY ticker
   )sql"));
-  (void)totals;
-  // Second MV depends on the first: one input commit also updates doubled_volume.
+  (void)stats;
+  // Second MV: derive mean sentiment from the current aggregate. COUNT is Int64,
+  // so division explicitly casts it to Float64 instead of relying on coercion.
   EF_ASSIGN_OR_RETURN(auto features, catalog->define_sql(R"sql(
-    CREATE MATERIALIZED VIEW market_features AS
-      SELECT ticker, total_volume, trade_count, total_volume * 2 AS doubled_volume
-      FROM trade_totals
+    CREATE MATERIALIZED VIEW news_features AS
+      SELECT ticker, news_count,
+             total_sentiment / CAST(news_count AS FLOAT64) AS average_sentiment,
+             sentiment_price_sum
+      FROM news_stats
   )sql"));
   for (const auto& statement : staged_ddl) {
     EF_ASSIGN_OR_RETURN(auto relation, catalog->define_sql(statement));
@@ -102,16 +114,16 @@ StatusOr<BoundComputation> bind_definition(const std::vector<std::string>& stage
   EF_ASSIGN_OR_RETURN(
       auto session,
       catalog->define_candidate(
-          {.name = "trading_session",
+          {.name = "news_session",
            .scope_fields =
                {{.id = 1, .name = "ticker", .type = DataType::String, .nullable = false}},
            .payload_fields = {
                {.id = 2, .name = "deadline_us", .type = DataType::Int64, .nullable = false}}}));
 
   ProcessorConfig definition;
-  definition.input_relations = {trades};
+  definition.input_relations = {news};
   definition.requests.emplace();
-  // The first trade opens one session per ticker. This finite example deliberately
+  // The first news update opens one session per ticker. This finite example deliberately
   // keeps it active until the Int64 deadline; a real application defines session rollover.
   definition.requests->candidate = CandidateExpiryPolicy{
       .relation = session,
@@ -126,45 +138,46 @@ StatusOr<BoundComputation> bind_definition(const std::vector<std::string>& stage
             .expected_epoch = 0, .payload = {std::numeric_limits<std::int64_t>::max()}});
       }};
 
-  // Evaluate the committed aggregate after a trade. The first total >= 100 admits
-  // one request in this session; later trades cannot replace its frozen input.
+  // At least two articles and mean sentiment >= 0.5 admit one request per session.
+  // Later news cannot replace the input already captured by that request.
   const auto threshold =
-      Trigger::on_event("volume_threshold",
-                        EventRef::source({.kind = "trades", .payload_relation = trades}))
-          .implementation_identity("streaming.volume_threshold.v1")
-          .when(ViewRef(features).column<std::int64_t>("total_volume") >= std::int64_t{100})
+      Trigger::on_event("sentiment_threshold",
+                        EventRef::source({.kind = "news_updates", .payload_relation = news}))
+          .implementation_identity("streaming.sentiment_threshold.v1")
+          .when((ViewRef(features).column<std::int64_t>("news_count") >= std::int64_t{2}) &&
+                (ViewRef(features).column<double>("average_sentiment") >= 0.5))
           .in_session(SessionRef::candidate(session))
-          .capture_current<&capture_features>(features, "streaming.capture_features.v1")
-          .request(
-              Function<&calculate_score>{.id = "trade_score",
-                                         .version = 1,
-                                         .implementation_identity = "streaming.trade_score.v1"},
-              {.id = "threshold_score_request",
-               .mode = RequestTriggerMode::Wait,
-               .pending_for = 1s,
-               .lifetime = 10s,
-               .once_per_candidate = true});
+          .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
+          .request(Function<&calculate_news_impact>{.id = "news_impact",
+                                                    .version = 1,
+                                                    .implementation_identity =
+                                                        "streaming.news_impact.v1"},
+                   {.id = "threshold_impact_request",
+                    .mode = RequestTriggerMode::Wait,
+                    .pending_for = 1s,
+                    .lifetime = 10s,
+                    .once_per_candidate = true});
 
   // Database time drives one clock per observed ticker. Each ready 200 ms slot
-  // captures the current cascaded MV and produces a separate score request.
+  // captures the current cascaded MV and produces a separate news impact request.
   // Overdue slots may be coalesced; this declaration does not promise a wall-time SLA.
   const auto periodic =
-      Trigger::clock("periodic_score", {.policy_id = "market_score_clock",
-                                        .every = 200ms,
-                                        .phase = 0ms,
-                                        .event_kind = "market_clock"})
-          .implementation_identity("streaming.periodic_score.v1")
+      Trigger::clock("periodic_impact", {.policy_id = "news_impact_clock",
+                                         .every = 200ms,
+                                         .phase = 0ms,
+                                         .event_kind = "news_clock"})
+          .implementation_identity("streaming.periodic_impact.v1")
           .in_session(SessionRef::candidate(session))
-          .capture_current<&capture_features>(features, "streaming.capture_features.v1")
-          .request(
-              Function<&calculate_score>{.id = "trade_score",
-                                         .version = 1,
-                                         .implementation_identity = "streaming.trade_score.v1"},
-              {.id = "periodic_score_request",
-               .mode = RequestTriggerMode::TryOnceAtFiring,
-               .pending_for = 1s,
-               .lifetime = 10s,
-               .once_per_candidate = false});
+          .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
+          .request(Function<&calculate_news_impact>{.id = "news_impact",
+                                                    .version = 1,
+                                                    .implementation_identity =
+                                                        "streaming.news_impact.v1"},
+                   {.id = "periodic_impact_request",
+                    .mode = RequestTriggerMode::TryOnceAtFiring,
+                    .pending_for = 1s,
+                    .lifetime = 10s,
+                    .once_per_candidate = false});
 
   EF_ASSIGN_OR_RETURN(auto snapshot, catalog->snapshot());
   // Bind SQL, captures, function views and requests into one Catalog before deployment.
@@ -175,7 +188,7 @@ StatusOr<BoundComputation> bind_definition(const std::vector<std::string>& stage
 } // namespace
 
 ComputationModule computation_module() noexcept {
-  return {.name = "streaming_market", .version = 1, .bind = &bind_definition};
+  return {.name = "streaming_news", .version = 1, .bind = &bind_definition};
 }
 
 } // namespace eventflow::streaming_example

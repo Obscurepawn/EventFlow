@@ -1,6 +1,6 @@
 # EventFlow 核心集群运行手册
 
-完整入口是[数据库主动消费示例](../examples/streaming_database/README.md)：独立声明成交表、两层物化视图和两个 Trigger，启动集群，向 HTTP 消息服务写入数据，再用 SQL 观察结果。消息消费、Clock 推进和函数完成均由数据库服务负责。此手册解释配置与运行边界；本轮验收状态以[当前规格](../specs/streaming-database-example.md)为准，历史测试结果不代替本轮验证。
+完整入口是[数据库主动消费示例](../examples/streaming_database/README.md)：独立声明六字段新闻表、两层物化视图和两个 Trigger，启动集群，向 HTTP 消息服务写入数据，再用 SQL 观察结果。消息消费、Clock 推进和函数完成均由数据库服务负责。此手册解释配置与运行边界；本轮验收状态以[当前规格](../specs/news-streaming-example.md)为准，历史测试结果不代替本轮验证。
 
 ## 一条命令运行完整流程
 
@@ -56,17 +56,17 @@ SQL client -> Coordinator -> owning Compute -> confirmed relations
 [definition.cpp](../examples/streaming_database/definition.cpp)在自己的 Catalog 中定义：
 
 ```text
-trades -> trade_totals -> market_features
+news_updates -> news_stats -> news_features
                               |
                   +-----------+------------+
                   |                        |
-            volume_threshold          periodic_score
+            sentiment_threshold          periodic_impact
              once per session          every 200 ms
                   |                        |
-                  +-> capture_current -> static trade_score -> result / Latest
+                  +-> capture_current -> static news_impact -> result / Latest
 ```
 
-`trade_totals` 按 ticker 维护 `SUM(volume)` 和 `COUNT(*)`；`market_features` 再计算两倍总量。`volume_threshold` 在成交后检查总量是否至少为 100，每个 session 最多受理一次；`periodic_score` 在已有 ticker 上每 200 ms 尝试一次请求。它们捕获受理时的 MV，函数计算 `doubled_volume + trade_count`。之后成交变化会更新 MV，但不会修改旧请求的固定输入。
+`news_stats` 按 ticker 维护新闻条数、情绪总和及 `SUM(sentiment_score * market_price)`；`news_features` 再计算平均情绪。`sentiment_threshold` 在新闻后检查条数至少为 2 且平均情绪至少为 0.5，每个 session 最多受理一次；`periodic_impact` 在已有 ticker 上每 200 ms 尝试一次请求。它们捕获受理时的新闻条数、平均情绪和情绪价格乘积合计，静态函数计算 `impact_score = sentiment_price_sum / news_count`。后续新闻不会修改旧请求的固定输入。
 
 `ComputationModule` 由稳定的 `name`、`version` 和 `bind` 工厂组成。工厂接收部署前 DDL，返回包含 Catalog、ProcessorConfig 和 FunctionRegistry 的完整 `BoundComputation`；`TriggerSet::bind` 校验并原子绑定定义。[main.cpp](../examples/streaming_database/main.cpp)把该模块传给 `database_main`，Coordinator 与所有 Compute 链接同一份模块并校验部署身份。
 
@@ -82,11 +82,11 @@ trades -> trade_totals -> market_features
   "source": {
     "type": "http",
     "endpoint": "http://127.0.0.1:8090",
-    "source_id": "market_feed",
-    "relation": "trades",
+    "source_id": "news_feed",
+    "relation": "news_updates",
     "assignments": [
-      {"topic": "trades", "partition": 0, "next_offset": "0"},
-      {"topic": "trades", "partition": 1, "next_offset": "0"}
+      {"topic": "news_updates", "partition": 0, "next_offset": "0"},
+      {"topic": "news_updates", "partition": 1, "next_offset": "0"}
     ],
     "poll_interval_ms": 10,
     "max_message_bytes": 262144
@@ -96,10 +96,10 @@ trades -> trade_totals -> market_features
 
 这是配置节选；节点身份、KV 地址和 Compute 路由仍需提供。完整字段解析见 [database_main.cpp](../src/service/database_main.cpp)。`type=http` 使用 `endpoint`，也可设置 `operation_timeout_ms` 和 `max_response_bytes`；`type=kafka` 使用 `bootstrap_servers` 和 `group_id`，复用相同 source/assignment/轮询合同。Kafka 为静态手动 assignment，真实 broker/Compose 集成需单独验证；HTTP 示例不是 Kafka 证据。
 
-消息 payload 是目标表 Schema 对应的 JSON 对象，或按 Schema 排列的 JSON 数组。本例生产的是：
+消息 payload 是目标表 Schema 对应的 JSON 对象，或按 Schema 排列的 JSON 数组。本例以 `(ticker, timestamp_us)` 标识新闻，完整存储标题、正文、预赋值情绪与新闻时点价格。生产 payload 形如：
 
 ```json
-{"ticker":"TICKER_0","trade_id":1,"volume":70}
+{"ticker":"TICKER_0","timestamp_us":1700000000000001,"headline":"Product outlook improves","text_body":"Demand is improving for the next quarter.","sentiment_score":0.25,"market_price":100.0}
 ```
 
 HTTP publish 用 `key_hex`/`payload_hex` 传递原始字节，具体请求见 [verify.cpp](../examples/streaming_database/verify.cpp)。当前自动接入要求非空 payload，tombstone 不自动映射为删除。可选 `timestamp_ms` 转换为事件时间微秒，并检查溢出；没有时间戳时使用本轮处理时间。业务 Row 决定数据库路由，原始消息 key 不替代 Schema 校验。
@@ -113,18 +113,18 @@ HTTP publish 用 `key_hex`/`payload_hex` 传递原始字节，具体请求见 [v
 | 阶段 | 输入与期望结果 |
 | --- | --- |
 | 部署前 | 两个 partition 各写两条，确认位置保持 `-1` |
-| 自动消费 | 两个 ticker 的成交总量为 120/130，笔数为 2/2，阈值评分为 242/262，next offset 为 2/2 |
+| 自动消费 | 两个 ticker 各有 2 条新闻，平均情绪为 0.5/0.625，阈值影响指标为 51.5/128，next offset 为 2/2 |
 | 无新输入 | 周期请求继续出现，源位置保持不变 |
-| 暂停追加 | 第一组追加成交量 30，暂停时 MV 和 ACK 位置保持不变 |
-| 恢复消费 | 总量变为 150、笔数为 3、周期评分变为 303，next offset 为 3/2 |
-| 固定输入 | 阈值请求仍只受理一次，捕获仍为 120/2/240，旧评分仍为 242 |
+| 暂停追加 | 第一组追加情绪 0.5、价格 112 的第三条新闻，暂停时 MV 和 ACK 位置保持不变 |
+| 恢复消费 | 新闻条数变为 3、平均情绪为 0.5、周期影响指标变为 53，next offset 为 3/2 |
+| 固定输入 | 阈值请求仍只受理一次，捕获仍为 2/0.5/103，旧指标仍为 51.5 |
 
 这些数值是示例代码的断言目标；实际通过情况须以本轮执行日志为准。客户端等待只读取 SQL 或源确认位置，没有调用 `ingest`、`pump` 或 `drain`。
 
 ```sql
-SELECT total_volume, trade_count FROM trade_totals WHERE ticker='TICKER_0';
-SELECT total_volume, trade_count, doubled_volume
-  FROM market_features WHERE ticker='TICKER_0';
+SELECT news_count, total_sentiment, sentiment_price_sum FROM news_stats WHERE ticker='TICKER_0';
+SELECT news_count, average_sentiment, sentiment_price_sum
+  FROM news_features WHERE ticker='TICKER_0';
 SELECT rule_id, evaluated_at_us, request_id
   FROM trigger_audit WHERE scope_key_0='TICKER_0';
 ```
