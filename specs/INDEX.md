@@ -1,5 +1,11 @@
 # 开发规格索引
 
+## 最近完成的 README 使用示例补充
+
+[README 使用示例](readme-usage-examples.md)已完成：补充当前物化视图 DDL、声明式 Trigger 和内置触发审计的 SQL/SDK 查询，明确“成交笔数”，并移除架构图顶部大标题。四段 C++ 片段编译、3/3 相关回归、图文检查及同轮双 reviewer 独立审查完成；不改变产品 API 或既有里程碑状态。
+
+用户追加的“Schema → 业务 case → 合并 DAG → Graph-Based 建模理由 → 代码”说明也已完成：单张图明确特征依赖、两类触发条件和评分目标，解释级联 MV 与 CEP 状态机的图结构。Mermaid 实际渲染、静态检查及同轮双 reviewer 审查完成，两处布局发现已定向修复；前次验证保留为对应范围的历史证据。
+
 ## 最近完成的数据库接入与示例重写
 
 [数据库主动消费与完整集群示例](streaming-database-example.md)已完成：旧 examples 退出，通用 ComputationModule/Runtime、Coordinator 托管 SourcePoller、HTTP 消息源和独立五进程示例接通。声明式 Trigger/级联 MV、自动消费与 SQL 断言经 Debug/Release 实跑验证；61/61 CTest、独立安装运行、文图检查及一轮并行双 reviewer 审查整改完成。README 架构图采用通用 IMessageSource/消息系统，居中以 720 像素显示。真实 Kafka 与新增故障注入仍按用户决定后置。

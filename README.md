@@ -2,11 +2,11 @@
 
 EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**。它接收持续到来的流式数据，用 SQL 物化视图更新特征；条件满足或定时器到期时，再按声明式 Trigger / Pattern 发起计算。保存的特征结果可以通过 SQL 查询。在设计之初，就设计成分布式系统，让系统具备具备水平扩容能力来处理超大规模数据集的能力。
 
+系统用两类依赖描述业务：**特征依赖决定先算什么后算什么，触发规则决定何时计算**。**前者通过级联物化视图表达计算图。后者组合事件条件、顺序和时钟，本质上是一个状态机，状态机本质上是由节点（状态）和有向边（转换条件）构成的有向图**。两者放在同一个系统内，便于管理计算定义、状态和结果。设计参考了 Flink 的CEP处理与 RisingWave 的持续物化视图维护机制。我的调研过程见[**调研文档**](docs/research.md)。
+
 虽然说原始题面只是要求实现一个Framework，但是由于一个纯粹的FeatureTopo Framework是比较难做到对海量数据仍然可以通过扩展处理能力来处理的。一般来说要做到这种程度，只有分布式计算框架/数据库才可以做到。基于这点考虑，我将整个Take Home Project做成一个完整的特征计算解决方案，而不是局限于Framework。**假如这不是个TakeHome Project，是一个需要在生产环境运行的系统，那么我会选择Fork RisingWave做二次开发，在SQL中扩展支持一下CEP Trigger这个feature，然后使用RisingWave的原生MV维护能力来表达特征计算的依赖关系。**
 
 对于这个TakeHome Project，后续我选择把这个Project做成数据库语义，因为我个人认为未来流式数据库取代流式计算框架是大势所趋，除此之外，做成数据库语义支持基于SQL对状态进行查询（这恰好是Flink这种系统的不足，虽然在早期有Queryable State，但是后续因为性能问题、Qos无法控制等原因也Deprecated了），整个系统的可观测性会好非常多。
-
-系统用两类依赖描述业务：**特征依赖决定先算什么，触发规则决定何时计算**。前者通过级联物化视图表达，后者组合事件条件、顺序和时钟。两者放在同一个系统内，便于管理计算定义、状态和结果。设计参考了 Flink 的CEP处理与 RisingWave 的持续物化视图维护机制。我的调研过程见[**调研文档**](docs/research.md)。
 
 目前计算逻辑仅支持通过物化视图DDL和用户自定义计算逻辑和数据库内核联合编译来自定义（**跟Flink/Spark等计算框架类似，需要定义计算逻辑后编译，然后也无法热插拔**），尚不支持UDF、WASM、Lua等灵活的自定义计算逻辑的能力，但在设计空间上是预留了足够的这种用户自定义计算逻辑的空间，扩展只是一个工程工作量的问题，并不会存在很大无法解决的工程困难，毕竟这种动态热插拔的逻辑实际上在SQLite、Clickhouse、RisingWave这种成熟数据库系统中已经做得很好了，有非常典型的best practice可以借鉴。
 
@@ -66,6 +66,103 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 
 ## 完整使用流程
 
+### 先看示例：数据 Schema、业务 case 与计算图
+
+#### 输入数据：一行是一笔成交
+
+这个 demo 按股票代码 `ticker` 持续接收成交记录，输入表为 `trades`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `ticker` | `STRING NOT NULL` | 股票代码，也是分区键；同一股票的特征在同一个 key 下维护 |
+| `trade_id` | `INT64 NOT NULL` | 该股票下的成交编号，与 `ticker` 一起构成主键 |
+| `volume` | `INT64 NOT NULL` | 这一笔成交的成交量 |
+
+主键为 `(ticker, trade_id)`，分区键为 `ticker`。两条不同 `trade_id` 的记录表示两笔成交；`COUNT(*)` 统计成交笔数，`SUM(volume)` 统计累计成交量。
+
+#### 业务 case：维护成交特征，按条件或周期计算评分
+
+假设我们要为每只股票维护三个特征：累计成交量 `total_volume`、成交笔数 `trade_count`，以及两倍累计成交量 `doubled_volume`。前两项由 `trade_totals` 聚合产生，第三项由级联的 `market_features` 计算；每次成交输入都会更新这些物化特征。
+
+在这些特征之上，再按两种规则计算评分 `score = doubled_volume + trade_count`。这个简单公式用于演示自定义函数计算：
+
+- **阈值评分 `volume_threshold`**：成交事件到来后，更新后的累计成交量 `>= 100`，且该股票的交易会话有效、该会话尚未受理过此规则的请求时，发起一次评分。受理时固定输入，同一会话最多受理一次。
+- **周期评分 `periodic_score`**：为已出现的股票每 `200 ms` 安排一个时钟时隙；会话有效时尝试按当前特征发起评分，输入未就绪则跳过。它与阈值规则独立，不需要先完成阈值评分；延迟的时隙可能合并。
+
+例如，同一股票在同一会话内依次出现三笔成交：
+
+| 新成交的 `trade_id / volume` | 当前特征：累计成交量 / 成交笔数 / 两倍累计成交量 | 阈值评分 | 后续周期评分成功时 |
+| --- | --- | --- | --- |
+| `1 / 70` | `70 / 1 / 140` | 未达到阈值 | 若捕获此时输入，评分为 `141` |
+| `2 / 50` | `120 / 2 / 240` | 首次满足条件；若此时受理，评分为 `242` | 若捕获此时输入，评分为 `242` |
+| `3 / 30` | `150 / 3 / 300` | 前次已受理，保持其固定输入和评分 `242` | 捕获更新后输入，评分为 `303` |
+
+这条时间线假定第二笔成交后的阈值请求已受理，才追加第三笔成交，与示例验证器的流程一致。周期请求读取各自受理时的特征，不保证每个中间状态都产生评分。
+
+#### 在同一张 DAG 上看特征依赖和触发目标
+
+**实线表示数据依赖，虚线表示事件、条件或请求激活。** 蓝色节点表示输入和持续维护的物化特征，紫色节点决定何时发起请求，绿色节点是 Trigger 最终触发的 `trade_score` 特征计算。
+
+```mermaid
+flowchart TB
+    subgraph live_features[" "]
+        trades["trades<br/>ticker, trade_id, volume"]
+        totals["trade_totals - MV<br/>total_volume = SUM(volume)<br/>trade_count = COUNT(*)"]
+        features["market_features - MV<br/>doubled_volume = total_volume * 2"]
+        trades --> totals --> features
+    end
+    session["trading_session<br/>Opened by the first trade per ticker"]
+    subgraph threshold_job[" "]
+        threshold["volume_threshold<br/>Trade event AND total_volume >= 100<br/>Active session AND not yet admitted"]
+        threshold_input["threshold_score_request<br/>capture_current at admission<br/>Frozen FeatureSnapshot"]
+        threshold_score["trade_score / calculate_score<br/>score = doubled_volume + trade_count<br/>Result for the threshold request"]
+        threshold -. "Wait / once per session" .-> threshold_input
+        threshold_input --> threshold_score
+    end
+    subgraph periodic_job[" "]
+        periodic["periodic_score<br/>200 ms Clock AND active session<br/>Independent of the threshold rule"]
+        periodic_input["periodic_score_request<br/>capture_current at admission<br/>Frozen FeatureSnapshot"]
+        periodic_score["trade_score / calculate_score<br/>score = doubled_volume + trade_count<br/>Result for each periodic request"]
+        periodic -. "TryOnceAtFiring" .-> periodic_input
+        periodic_input --> periodic_score
+    end
+
+    trades -. "first trade" .-> session
+    trades -. "on_event: after MV update" .-> threshold
+    features -. "read total_volume" .-> threshold
+    session -. "session / once" .-> threshold
+    session -. "active session" .-> periodic
+    features -->|"read at admission"| threshold_input
+    features -->|"read at admission"| periodic_input
+    classDef materialized fill:#e8f3ff,stroke:#2563eb,color:#172554;
+    classDef control fill:#f3e8ff,stroke:#9333ea,color:#3b0764;
+    classDef snapshot fill:#fff7ed,stroke:#ea580c,color:#431407;
+    classDef result fill:#ecfdf5,stroke:#16a34a,color:#14532d;
+    class trades,totals,features materialized;
+    class session,threshold,periodic control;
+    class threshold_input,periodic_input snapshot;
+    class threshold_score,periodic_score result;
+```
+
+两条 Trigger 都触发同一个静态评分函数 `calculate_score`，但各自创建请求、固定输入并保存结果；图中两个绿色节点表示两类请求的独立计算。MV 随成交持续更新，评分函数在请求受理后执行。每次发出的触发还会记录到 `trigger_audit`，可用于后文的 SQL 查询；审计记录不依赖评分成功。
+
+#### 为什么用 MV 表达计算依赖，用 CEP 表达事件触发
+
+**方案采用 Graph-Based（基于图）的建模方式：级联物化视图本质上是一张计算依赖图，CEP 背后的状态机本质上也是一张图。** 两者分别表达“怎么算”和“何时触发”，并通过“触发请求 → 目标特征计算”连接起来：
+
+| Graph | 节点表示什么 | 边表示什么 |
+| --- | --- | --- |
+| **Feature Computation Graph** | 输入表、保存中间特征的 MV、目标函数计算 | 下游计算对上游结果的数据依赖 |
+| **Trigger State Graph** | 等待事件、部分匹配、匹配完成等状态 | 事件和条件驱动的状态转移，附带顺序和时间约束 |
+
+**特征计算图描述“一个特征由哪些数据算出来”。** 可以把 MV 理解为“数据库持续替你维护结果的一条查询”：查询的投影、筛选、聚合等表达式定义计算，`FROM` / `JOIN` 引用的上游关系定义依赖；后续 MV 再引用前面的 MV，就形成一张有向计算图。例如 `trades → trade_totals → market_features`，分别完成成交存储、聚合和派生特征。流式 MV 的增量维护机制让新数据沿依赖更新已有结果，中间特征也可以直接查询。这个做法与 RisingWave 的持续维护和级联 MV 模型一致，适合本例可用关系运算表达的特征。[RisingWave MV](https://docs.risingwave.com/sql/commands/sql-create-mv)
+
+**事件依赖图描述“哪些事件、以什么顺序、满足什么条件后，才允许触发”。** CEP（Complex Event Processing，复杂事件处理）专门匹配这类事件模式：其状态机的节点代表等待事件、部分匹配和匹配完成等状态，边代表由事件及条件驱动的状态转移，再附加时间窗口。比如“先收到事件 A，再在 2 秒内收到满足条件的事件 B，就触发计算”，运行时需要记住 A 已出现、接下来等待 B，以及何时超时；这些等待和转移可以用状态机表达，模式匹配完成后发出触发。这样的状态图可以包含循环，本身不要求是 DAG。Flink CEP 的事件条件、顺序匹配和 `within` 窗口就是这样的抽象。[Flink CEP](https://nightlies.apache.org/flink/flink-docs-release-1.19/docs/libs/cep/)
+
+EventFlow 因此把两类规则接在一起：**MV 持续维护特征，Trigger / CEP 决定何时发起请求，受理时固定输入，再执行目标函数。** 当前 demo 使用的是条件 Trigger 和 Clock Trigger；需要“先 A 后 B”等序列匹配时，才使用 [Pattern API](include/eventflow/trigger_pattern.hpp) 和有界 CEP 状态机。计算函数之间“上游结果已完成，才可执行下游”的依赖由计算图和请求执行器管理；CEP 状态图负责事件模式的匹配。这样可以分别描述“怎么算”和“何时算”，同时复用同一个 Catalog 中的特征及计算定义。
+
+下面再依次说明这些 Schema、MV 和 Trigger 如何通过代码定义，以及如何部署、输入数据和查询结果。
+
 ### 1. 定义输入表、级联 MV 和 Trigger
 
 先在[示例计算定义](examples/streaming_database/)中描述业务数据和计算规则：
@@ -82,6 +179,116 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 **MV 表达“算什么以及依赖什么”，Trigger 表达“何时发起一次计算”。** 更新 MV 不要求客户端按依赖逐步调用函数；用户通过声明式 Trigger API 绑定规则，也无需手工编写运行时状态转移。
 
 这些定义共同组成一个 `ComputationModule`，随示例数据库程序静态编译。Coordinator 与 Compute 使用相同的模块身份和 Catalog。修改 C++ 函数或 Trigger 后需要重新编译、重新部署；当前不支持通过 SDK 上传 C++ 闭包，也不支持动态 UDF、UDTF、UDAF 或热插拔插件。
+
+#### 1.1 用 SQL 定义物化视图
+
+下面沿用 [definition.cpp](examples/streaming_database/definition.cpp) 的成交示例。代码位于返回 `StatusOr<BoundComputation>` 的 `bind_definition(...) noexcept` 工厂内，使用 `eventflow` 命名空间；`EF_ASSIGN_OR_RETURN` 在失败时提前返回错误状态 `Status`（由工厂的 `StatusOr<T>` 承载），在成功时取得结果。
+
+```cpp
+EF_ASSIGN_OR_RETURN(auto catalog, Catalog::create());
+
+// Each trade has its own identity; all trades for one ticker share a partition.
+EF_ASSIGN_OR_RETURN(auto trades, catalog->define_sql(R"sql(
+  CREATE TABLE trades (
+    ticker STRING NOT NULL,
+    trade_id INT64 NOT NULL,
+    volume INT64 NOT NULL,
+    PRIMARY KEY (ticker, trade_id)
+  ) PARTITION BY (ticker)
+)sql"));
+
+// First MV: maintain the total volume and trade count for each ticker.
+EF_ASSIGN_OR_RETURN(auto totals, catalog->define_sql(R"sql(
+  CREATE MATERIALIZED VIEW trade_totals AS
+    SELECT ticker, SUM(volume) AS total_volume, COUNT(*) AS trade_count
+    FROM trades GROUP BY ticker
+)sql"));
+(void)totals;
+
+// Second MV: derive another feature from the first MV.
+EF_ASSIGN_OR_RETURN(auto features, catalog->define_sql(R"sql(
+  CREATE MATERIALIZED VIEW market_features AS
+    SELECT ticker, total_volume, trade_count, total_volume * 2 AS doubled_volume
+    FROM trade_totals
+)sql"));
+```
+
+`define_sql` 把关系注册到 Catalog，返回供后续 API 引用的 `RelationId`。这里的依赖是 `trades → trade_totals → market_features`；部署后每条成交输入都会沿依赖更新两级 MV，用户无需手动刷新。例如同一 ticker 先后收到两条不同 `trade_id` 的成交记录，成交量分别为 `70` 和 `50`，当前特征就是累计成交量 `120`、成交笔数 `2`（即两笔成交）、两倍累计成交量 `240`。
+
+#### 1.2 用声明式 API 定义 Trigger
+
+下面的片段继续使用 `trades` 和 `features`。其中 `session` 是同一工厂通过 `Catalog::define_candidate` 定义的 `trading_session`；`ProcessorConfig::requests->candidate` 在首条成交时为该 ticker 激活会话。完整会话策略、类型和 `SchemaTraits` 映射见 [definition.cpp](examples/streaming_database/definition.cpp)。**调用 `.in_session(...)` 是引用已配置的会话，不会自行创建或续期会话。**
+
+`capture_features` 将当前 MV 的累计成交量、成交笔数和两倍累计成交量映射为 `FeatureSnapshot`，并检查 SQL `SUM` 的可空值；`calculate_score` 是返回 `StatusOr<Score>` 的 `noexcept` C++ 函数，计算 `doubled_volume + trade_count`，包含整数溢出检查。以下把它声明为静态 `Function`：
+
+```cpp
+using namespace std::chrono_literals;
+
+const auto trade_event =
+    EventRef::source({.kind = "trades", .payload_relation = trades});
+const auto score_function =
+    Function<&calculate_score>{.id = "trade_score",
+                               .version = 1,
+                               .implementation_identity = "streaming.trade_score.v1"};
+
+// Evaluate the updated MV after each trade for this ticker.
+const auto threshold =
+    Trigger::on_event("volume_threshold", trade_event)
+        .implementation_identity("streaming.volume_threshold.v1")
+        .when(ViewRef(features).column<std::int64_t>("total_volume") >= std::int64_t{100})
+        .in_session(SessionRef::candidate(session))
+        // Freeze the current features when the request is admitted.
+        .capture_current<&capture_features>(features, "streaming.capture_features.v1")
+        .request(score_function,
+                 {.id = "threshold_score_request",
+                  .mode = RequestTriggerMode::Wait,
+                  .pending_for = 1s,
+                  .lifetime = 10s,
+                  .once_per_candidate = true});
+
+// Database time drives one clock per observed ticker with an active session.
+const auto periodic =
+    Trigger::clock("periodic_score", {.policy_id = "market_score_clock",
+                                      .every = 200ms,
+                                      .phase = 0ms,
+                                      .event_kind = "market_clock"})
+        .implementation_identity("streaming.periodic_score.v1")
+        .in_session(SessionRef::candidate(session))
+        .capture_current<&capture_features>(features, "streaming.capture_features.v1")
+        .request(score_function,
+                 {.id = "periodic_score_request",
+                  .mode = RequestTriggerMode::TryOnceAtFiring,
+                  .pending_for = 1s,
+                  .lifetime = 10s,
+                  .once_per_candidate = false});
+```
+
+| 声明 | 在此例中的含义 |
+| --- | --- |
+| `on_event(...).when(...)` | 每条 `trades` 事件到来后，读取同 ticker 更新后的 MV，检查总量是否 `>= 100`；这是条件判断，不自动表示“从低于阈值穿越到高于阈值” |
+| `in_session(...)` | 将请求绑定到该 ticker 的活动业务会话，期限及换代由 candidate policy 管理 |
+| `capture_current(...)` | 在请求受理时读取并固定输入；若等待后才受理，读取的是那时的 MV，后续成交不会改写已固定的输入 |
+| `Wait` / `TryOnceAtFiring` | 前者可在 `pending_for` 内等待受理条件就绪；后者只尝试当前触发时隙，未就绪就跳过 |
+| `once_per_candidate` | `true` 表示同一会话中该 binding 最多受理一次；成功受理才消耗次数，计算随后失败也不会归还 |
+| `lifetime` | 请求受理后的执行期限，与等待受理的 `pending_for` 分开 |
+| `clock(..., .every = 200ms)` | 为已观察到的 key 安排周期时隙；活动会话允许时发起请求，过期时隙可能合并，不保证每 200 ms 完成一次计算 |
+
+上述阈值请求受理时若特征为 `120、2、240`，评分就是 `242`。再追加成交量 `30`，当前 MV 会变为 `150、3、300`，周期请求可以得到 `303`；已受理的阈值请求仍保留原输入和评分 `242`。
+
+#### 1.3 统一绑定计算定义
+
+链式 API 先描述规则，最后由 `TriggerSet::bind` 校验并装配。下面接在同一工厂末尾；`definition` 是已经配置 `input_relations` 和上述 candidate policy 的 `ProcessorConfig`，完整初始化见 [definition.cpp](examples/streaming_database/definition.cpp)。
+
+```cpp
+EF_ASSIGN_OR_RETURN(auto snapshot, catalog->snapshot());
+
+// Bind the SQL graph, triggers, captures, functions and requests as one definition.
+// The protected trigger_audit relation is installed automatically.
+return TriggerSet::bind(std::move(snapshot), std::move(definition),
+                        {threshold, periodic}, {.shard_count = 2});
+```
+
+绑定结果包含 Catalog、函数 Registry 和运行定义；`bound.explain()` 可查看规则及生成关系，列名、类型、scope 和引用冲突在启动绑定时以状态错误返回。应用通过 `ComputationModule` 提供这个工厂，再由 [main.cpp](examples/streaming_database/main.cpp) 将模块传给 `database_main`。
 
 ### 2. 启动消息服务和数据库集群
 
@@ -112,6 +319,81 @@ Compute 先按依赖更新基表和级联 MV，再检查相关 Trigger。符合�
 客户端通过 Coordinator 查询基表、级联 MV、成功计算结果和内置 `trigger_audit`。示例将预期业务结果写成断言，并覆盖不同 shard 的 key；追加消息后再次查询，确认数据库继续自动计算。
 
 触发审计记录说明某条规则已经发出触发，函数是否成功需要结合请求状态和成功结果判断。SQL 查询不会隐式发起模型计算。
+
+#### 5.1 SELECT 当前特征和触发记录
+
+`TriggerSet::bind` 会自动安装内置只读关系 **`trigger_audit`**，无需自行执行建表 DDL，也无需在用户函数中插入日志。每个实际发出的 occurrence 对应一行，与该轮触发状态一起原子提交；同一输入重放不会重复新增相同触发记录。
+
+以下 `TICKER_0` 应替换为运行时实际输出的 ticker。业务表使用 `ticker`，审计表则统一使用 `scope_key_0`；复合业务 key 对应 `scope_key_0、scope_key_1、...`，具体映射可查 `bound.explain()["trigger_audit"]["scope_columns"]`。
+
+```sql
+-- Read the current materialized features.
+SELECT total_volume, trade_count, doubled_volume
+  FROM market_features WHERE ticker='TICKER_0';
+
+-- List emitted triggers for one business key.
+SELECT occurrence_id, rule_id, event_kind, occurred_at_us, evaluated_at_us,
+       request_id, binding_id, plan
+  FROM trigger_audit WHERE scope_key_0='TICKER_0';
+
+-- Inspect only the threshold rule, including the source message identity.
+SELECT occurrence_id, request_id, source_topic, source_partition, source_offset
+  FROM trigger_audit
+  WHERE scope_key_0='TICKER_0' AND rule_id='volume_threshold';
+
+-- Inspect periodic firings and coalesced clock slots.
+SELECT occurrence_id, scheduled_at_us, evaluated_at_us, skipped_slots, request_id
+  FROM trigger_audit
+  WHERE scope_key_0='TICKER_0' AND rule_id='periodic_score';
+```
+
+| 字段 | 如何解读 |
+| --- | --- |
+| `occurrence_id` | 一次实际触发的稳定身份；同一规则的多次触发有不同身份 |
+| `rule_id` / `event_kind` | 例如 `volume_threshold` / `trades`，或 `periodic_score` / `market_clock` |
+| `occurred_at_us` / `evaluated_at_us` | occurrence 的逻辑发生时间 / 实际评估时的 processing time，单位均为微秒；不是函数完成时间 |
+| `scheduled_at_us` / `skipped_slots` | Clock 的计划时隙 / 合并跳过的时隙数；普通 source 触发的计划时间为 NULL |
+| `request_id` / `binding_id` / `plan` | 关联请求身份、请求绑定及计算计划；未绑定请求的 Trigger 这些列为 NULL |
+| `source_topic` / `source_partition` / `source_offset` | source 触发所对应的输入位置；Clock 触发这些列为 NULL |
+
+#### 5.2 通过 C++ SDK 查询并读取返回行
+
+集群查询入口是 [ClusterClient::query](include/eventflow/cluster_client.hpp)。下面是可加入客户端的辅助函数：`endpoint` 为 Coordinator 地址，`ticker` 为已经写入消息的业务 key。`scope` 单独传给 SDK，用于路由和限定单 key 查询，因此这条 SQL 可以不再拼接 ticker 条件。
+
+```cpp
+#include "eventflow/cluster_client.hpp"
+#include <iostream>
+
+using namespace eventflow;
+
+Status print_trigger_audit(std::string_view endpoint, const std::string& ticker) noexcept {
+  EF_ASSIGN_OR_RETURN(auto client, ClusterClient::open(endpoint));
+  const Row scope{ticker};
+
+  // The explicit scope restricts this query to one ticker.
+  EF_ASSIGN_OR_RETURN(auto audit, client->query(R"sql(
+    SELECT occurrence_id, rule_id, event_kind, occurred_at_us, request_id
+      FROM trigger_audit
+  )sql", scope, 128, 1024 * 1024));
+
+  // SELECT column order is shared by audit.fields and each returned row.
+  for (const auto& row : audit.rows) {
+    Json record = Json::object();
+    for (std::size_t index = 0; index < row.size(); ++index) {
+      EF_ASSIGN_OR_RETURN(auto value, value_to_json(row[index]));
+      record[audit.fields[index].name] = std::move(value);
+    }
+    std::cout << record.dump() << '\n';
+  }
+  return {};
+}
+```
+
+`audit.rows` 是已保存的触发记录，`audit.fields` 给出列名和类型；查询参数 `128` 和 `1024 * 1024` 分别是本次读取的行数与字节预算。当前 SQL 按单 key 读取，不支持通过省略 scope 来全局扫描；不保证时间排序，需要时在客户端按 `evaluated_at_us` 和 `occurrence_id` 排序。
+
+**审计行表示“已发出触发”，不表示“请求已受理”或“计算已成功”。** 已发出但仍在等待、或在 `TryOnceAtFiring` 中跳过的记录也会保留；仅仅条件不满足、once 已消费或没有活动会话而未发出的触发不会记行。需要追踪结果时，取出非 NULL 的 `request_id`，使用 `client->read_request(scope, request_id)` 查询请求状态；尚未受理或已跳过时可能返回 `NotFound`。计算结果关系名从 `bound.explain()` 和 Catalog 获取，完整读取方法见 [verify.cpp](examples/streaming_database/verify.cpp)。
+
+审计历史有界：默认每个 scope 最多保留最近 **128 行**，且 KV key 加编码行的总大小不超过 **256 KiB**，超过任一限制会淘汰旧记录；消费触发 outbox 不会删除这些历史。时间和 offset 使用 `INT64`；`rule_version`、`skipped_slots`、`firing_revision` 等 UInt64 元数据以十进制字符串保存。需要长期审计时，应在记录被淘汰前自行导出。
 
 暂停、恢复和一致 checkpoint 用于控制正在运行的数据库。checkpoint 需要绑定源位置、Catalog 与运行时状态；KV snapshot 只是存储边界，不能单独作为完整恢复点。RocksDB WAL 仍然保留。
 

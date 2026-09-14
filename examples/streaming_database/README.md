@@ -132,6 +132,8 @@ SELECT total_volume, trade_count, doubled_volume
 
 `verify.cpp` 还查询阈值结果和固定输入，比较追加成交前后的整个捕获行（包括 request_id）完全一致；周期 Latest 则必须出现 `303`。
 
+逐条查看规则发出的触发，可查询自动安装的 `trigger_audit`，其业务 key 列为 `scope_key_0`。完整 SQL、C++ SDK 读取代码以及触发与计算成功的区别见[根 README 的触发记录查询](../../README.md#51-select-当前特征和触发记录)；此处验证程序仍以特征和评分断言为主。
+
 ## 正常 checkpoint 与边界
 
 最后验证器暂停数据库，读取固定下来的 `status.now_us`，创建完整 `streaming-cut` checkpoint，再恢复 RUNNING。checkpoint 必须返回 `complete=true`，并包含源位置、Catalog 指纹和各 Compute 的运行状态切面；它不是单独调用 RocksDB flush。共享 KV 保留 RocksDB WAL。
