@@ -3,6 +3,7 @@
 #include "eventflow/coordinator_service.hpp"
 #include "eventflow/kv_server.hpp"
 #include "eventflow/types.hpp"
+#include "eventflow/udf.hpp"
 #include <charconv>
 #include <chrono>
 #include <csignal>
@@ -176,6 +177,11 @@ Status run(int argc, char** argv, const ComputationModule& module) noexcept {
       config.node_id = json["node_id"].get<std::string>();
       config.shard_count = json.value("shard_count", 1U);
       config.owner = json.value("owner", std::string("deployment-1"));
+      if (json.contains("allow_native_udfs")) {
+        EF_RETURN_IF_ERROR(
+            check(json["allow_native_udfs"].is_boolean(), "allow_native_udfs must be boolean"));
+        config.allow_native_udfs = json["allow_native_udfs"].get<bool>();
+      }
 
       for (const auto& shard : json["shards"]) {
         EF_RETURN_IF_ERROR(
@@ -200,8 +206,16 @@ Status run(int argc, char** argv, const ComputationModule& module) noexcept {
       config.cluster_id = json.value("cluster_id", std::string("eventflow-core"));
       config.shard_count = json.value("shard_count", 2U);
       config.owner = json.value("owner", std::string("deployment-1"));
+      if (json.contains("allow_native_udfs")) {
+        EF_RETURN_IF_ERROR(
+            check(json["allow_native_udfs"].is_boolean(), "allow_native_udfs must be boolean"));
+        config.allow_native_udfs = json["allow_native_udfs"].get<bool>();
+      }
+
       config.restore_checkpoint = json.value("restore_checkpoint", std::string{});
       config.tick_interval_ms = json.value("tick_interval_ms", 100U);
+      if (config.allow_native_udfs)
+        config.max_request_bytes = 2 * max_udf_bytes + 65536;
 
       for (const auto& node : json["nodes"]) {
         EF_RETURN_IF_ERROR(check(node.is_object() && node.contains("node_id") &&

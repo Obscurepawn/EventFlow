@@ -1,5 +1,25 @@
 # 开发规格索引
 
+## 图片清理
+
+[未使用图片清理](image-cleanup.md)：清理 docs/image 中七张无实际引用的旧图，保留其余 29 张；引用核对与同轮两位独立审查已完成。
+
+## 最近完成的默认流式示例调整
+
+[流式数据库示例默认使用上传 UDF](streaming-udf-default.md)已完成：streaming_database 和根 README 以 UDF 上传为默认用法；静态模块保留在 static_streaming，native_udf 转发兼容。4/4 定向回归、Release 安装与恢复、两个参考入口、四段 C++ 片段和同轮双 reviewer 审查完成。README 使用直接的文件/计算描述，Coding Agent 章节改为加载 skill 后描述业务需求。
+
+## 最近完成的生产 UDF README 图文同步
+
+[README 与生产 UDF 图文同步](readme-native-udf-sync.md)已完成：README 当前能力、SDK 入口、详细架构及注册/运行时序三张 PNG 已对齐生产接口，保留静态示例。图示校验、1100 px 静态图检查、SDK 片段编译及同轮双 reviewer 审阅完成，一项去重文案发现已修正。
+
+## 最近完成的生产 C++ UDF 接入
+
+[生产 C++ UDF 上传与首次部署](native-udf-delivery.md)已完成：服务启动后通过 SDK 上传 `.so`、提交定义、首次部署，真实两个 Compute 计算并从 Rocks checkpoint 恢复制品，无须重新上传。65/65 回归、Debug/Release、安装目录端到端与同轮双 reviewer 审查完成；边界自查项已修复并定向复验。运行中追加计算图、独立 Worker 与完整扩展族仍后置。
+
+## 最近完成的 C++ 动态函数示例
+
+[C++ 动态函数示例](cpp-udf-example.md)已完成：同一构建环境下 `.so` 直接使用 C++ 数据结构并接入 Simple/ThreadPool 执行器。Debug/Release、2/2 定向回归、安装目录实跑、错误路径、原集群示例和同轮双 reviewer 审查通过；一项去重验证缺口已补齐。SDK 上传、在线计算图安装和独立 Worker 不在本轮示例范围。
+
 ## 最近完成的 README 图示更新
 
 [README 架构与消息处理时序图](readme-archify-diagrams.md)已完成：详细架构图展开 Compute 内部组件，时序图采用用户指定 SVG 对应的 PNG。README 仅嵌入静态图；同轮双 reviewer 发现已记录并定向处置，本次 20 个未引用中间文件已移出，存量图片保留。见[本轮验证](reviews/README-diagrams-validation.md)。

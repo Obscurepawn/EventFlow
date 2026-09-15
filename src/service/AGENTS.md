@@ -10,6 +10,8 @@
 
 ## 必须保持的契约
 
+- 原生 UDF 上传和结构化定义提交须显式启用 `allow_native_udfs`，限定首次部署前 STAGING。元数据/原始库字节同批写入 control shard，UNKNOWN 确认原批；Compute 从 KV 按摘要重载。详见 [生产 UDF 规格](../../specs/native-udf-delivery.md)，不把首次部署表述为在线迁移。
+
 - 当前部署是 1 Coordinator、1 共享 KV、N Compute；生产 Compute 使用 Remote KV。业务 shard 静态分配，同 shard 单 owner 串行处理，节点级 gate 建立控制屏障。
 - 业务 shard 数为 S 时，control shard 为 S，KV 物理 shard 总数为 S+1；路由 hash 仍使用 S，不能混入控制分区。
 - Coordinator 是元数据权威，Compute 校验安装版本、Catalog 指纹、全局 shard 数与 assignment；全部确认前不得开放 RUNNING。

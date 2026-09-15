@@ -1,4 +1,5 @@
 #include "definition.hpp"
+#include "eventflow/catalog_codec.hpp"
 #include "eventflow/cluster_client.hpp"
 #include "eventflow/key_codec.hpp"
 #include <algorithm>
@@ -10,7 +11,7 @@
 #include <string_view>
 #include <thread>
 
-namespace eventflow::streaming_example {
+namespace eventflow::native_udf_example {
 namespace {
 
 struct NewsUpdate {
@@ -130,8 +131,8 @@ StatusOr<TriggerRelations> relations(const BoundComputation& bound,
     return TriggerRelations{.capture = capture->name,
                             .result = result->name,
                             .latest = latest->name,
-                            .capture_columns = fields[2].name + " AS news_count," + fields[3].name +
-                                               " AS average_sentiment," + fields[4].name +
+                            .capture_columns = fields[2].name + " AS captured_ticker," +
+                                               fields[3].name + " AS news_count," + fields[4].name +
                                                " AS sentiment_price_sum,request_id"};
   }
   return Status(ErrorCode::NotFound, "trigger is absent from the bound definition");
@@ -241,6 +242,7 @@ StatusOr<std::vector<Row>> verify_threshold(ClusterClient& client, const std::st
                                             const TriggerRelations& trigger,
                                             double average_sentiment, double sentiment_price_sum,
                                             double score) noexcept {
+  (void)average_sentiment;
   EF_ASSIGN_OR_RETURN(auto result,
                       query(client, ticker, "impact_score,request_id", trigger.result));
   EF_ASSIGN_OR_RETURN(auto capture,
@@ -248,24 +250,40 @@ StatusOr<std::vector<Row>> verify_threshold(ClusterClient& client, const std::st
   EF_RETURN_IF_ERROR(require(result.rows.size() == 1 && result.rows[0].size() == 2 &&
                                  result.rows[0][0] == Value(score),
                              "once-per-session threshold must produce exactly one expected score"));
-  EF_RETURN_IF_ERROR(require(capture.rows.size() == 1 &&
-                                 capture.rows[0] == Row{std::int64_t{2}, average_sentiment,
-                                                        sentiment_price_sum, result.rows[0][1]},
-                             "threshold request must retain its admission-time feature snapshot"));
+  EF_RETURN_IF_ERROR(require(
+      capture.rows.size() == 1 &&
+          capture.rows[0] == Row{ticker, std::int64_t{2}, sentiment_price_sum, result.rows[0][1]},
+      "threshold request must retain its admission-time feature snapshot"));
   EF_RETURN_IF_ERROR(display(ticker + " threshold result", result));
   EF_RETURN_IF_ERROR(display(ticker + " threshold frozen input", capture));
   return std::move(capture.rows);
 }
 
-Status run(const std::string& meta_endpoint, const std::string& source_endpoint) noexcept {
-  EF_ASSIGN_OR_RETURN(auto bound, computation_module().bind({}));
+Status run(const std::string& meta_endpoint, const std::string& source_endpoint,
+           const std::string& library_path) noexcept {
+  EF_ASSIGN_OR_RETURN(auto client,
+                      ClusterClient::open(meta_endpoint, {.timeout_seconds = 30,
+                                                          .max_request_bytes = 4 * 1024 * 1024}));
+  EF_ASSIGN_OR_RETURN(auto initial, client->discover());
+  EF_RETURN_IF_ERROR(require(initial.value("state", std::string{}) == "STAGING",
+                             "servers must start before UDF registration"));
+  EF_ASSIGN_OR_RETURN(auto function, client->register_udf(library_path));
+  EF_ASSIGN_OR_RETURN(auto duplicate, client->register_udf(library_path));
+  EF_RETURN_IF_ERROR(require(encode_function_ref(function) == encode_function_ref(duplicate),
+                             "repeated registration must retain the exact version"));
+  const auto definition = computation_definition(function);
+  EF_ASSIGN_OR_RETURN(auto submitted, client->submit_computation(definition));
+  EF_ASSIGN_OR_RETURN(auto metadata, client->catalog());
+  BoundComputation bound;
+  EF_ASSIGN_OR_RETURN(bound.catalog, decode_catalog(metadata["catalog"].get<std::string>()));
+  bound.explanation = submitted["explanation"];
+  std::cout << "[udf] registered " << encode_function_ref(function).dump() << '\n';
   EF_ASSIGN_OR_RETURN(auto news_relation, bound.catalog.find("news_updates"));
   EF_RETURN_IF_ERROR(
       require(news_relation->visible_count == 6, "news schema must expose exactly six fields"));
   EF_ASSIGN_OR_RETURN(auto threshold, relations(bound, "sentiment_threshold"));
   EF_ASSIGN_OR_RETURN(auto periodic, relations(bound, "periodic_impact"));
   EF_ASSIGN_OR_RETURN(auto keys, business_keys());
-  EF_ASSIGN_OR_RETURN(auto client, ClusterClient::open(meta_endpoint, {.timeout_seconds = 10}));
   EF_ASSIGN_OR_RETURN(auto discovered, client->discover());
   EF_RETURN_IF_ERROR(require(discovered.value("state", std::string{}) == "STAGING",
                              "example needs a fresh STAGING cluster"));
@@ -392,7 +410,7 @@ Status run(const std::string& meta_endpoint, const std::string& source_endpoint)
   (void)checkpoint_pause;
   EF_ASSIGN_OR_RETURN(auto status, client->status());
   EF_ASSIGN_OR_RETURN(auto checkpoint_time, decimal(status["now_us"]));
-  EF_ASSIGN_OR_RETURN(auto checkpoint, client->checkpoint("streaming-cut", checkpoint_time));
+  EF_ASSIGN_OR_RETURN(auto checkpoint, client->checkpoint("native-cut", checkpoint_time));
   EF_RETURN_IF_ERROR(require(checkpoint.value("complete", false), "checkpoint is incomplete"));
   const Json checkpoint_summary{{"checkpoint_id", checkpoint["checkpoint_id"]},
                                 {"now_us", checkpoint["now_us"]},
@@ -403,20 +421,49 @@ Status run(const std::string& meta_endpoint, const std::string& source_endpoint)
   EF_ASSIGN_OR_RETURN(auto running, client->resume());
   EF_RETURN_IF_ERROR(require(running.value("state", std::string{}) == "RUNNING",
                              "resume after checkpoint failed"));
-  std::cout << "STREAMING_DATABASE_OK shards=2 news_counts=3,2 threshold_impacts=51.5,128 "
+  std::cout << "NATIVE_UDF_DATABASE_OK shards=2 news_counts=3,2 threshold_impacts=51.5,128 "
                "periodic_impact=53 source_next_offsets=3,2\n";
   return {};
 }
 
+Status verify_restore(const std::string& meta_endpoint,
+                      const std::string& source_endpoint) noexcept {
+  EF_ASSIGN_OR_RETURN(auto client, ClusterClient::open(meta_endpoint, {.timeout_seconds = 30}));
+  EF_ASSIGN_OR_RETURN(auto metadata, client->catalog());
+  BoundComputation bound;
+  EF_ASSIGN_OR_RETURN(bound.catalog, decode_catalog(metadata["catalog"].get<std::string>()));
+  bound.explanation = metadata["explanation"];
+  EF_ASSIGN_OR_RETURN(auto periodic, relations(bound, "periodic_impact"));
+  EF_ASSIGN_OR_RETURN(auto threshold, relations(bound, "sentiment_threshold"));
+  EF_ASSIGN_OR_RETURN(auto keys, business_keys());
+  EF_ASSIGN_OR_RETURN(auto deployed, client->deploy());
+  (void)deployed;
+  EF_RETURN_IF_ERROR(wait_score(*client, keys[0], periodic, 53.0));
+  const NewsUpdate additional{.ticker = keys[0],
+                              .timestamp_us = 1700000003000000,
+                              .headline = "Restored model input",
+                              .text_body = "Execute the UDF retained in the checkpoint.",
+                              .sentiment_score = 0.5,
+                              .market_price = 120.0};
+  EF_RETURN_IF_ERROR(publish(source_endpoint, additional, 0, 3));
+  EF_RETURN_IF_ERROR(wait_score(*client, keys[0], periodic, 54.75));
+  EF_ASSIGN_OR_RETURN(auto frozen, verify_threshold(*client, keys[0], threshold, 0.5, 103.0, 51.5));
+  (void)frozen;
+  std::cout << "NATIVE_UDF_RESTORE_OK impact=54.75 frozen_impact=51.5 no_reupload=true\n";
+  return {};
+}
+
 } // namespace
-} // namespace eventflow::streaming_example
+} // namespace eventflow::native_udf_example
 
 int main(int argc, char** argv) noexcept {
-  if (argc != 3) {
-    std::cerr << "Usage: eventflow_streaming_verify META_ENDPOINT MESSAGE_ENDPOINT\n";
+  if ((argc != 4 && argc != 5) || (argc == 5 && std::string_view(argv[4]) != "restore")) {
+    std::cerr << "Usage: eventflow_native_udf_verify META_ENDPOINT MESSAGE_ENDPOINT UDF_LIBRARY "
+                 "[restore]\n";
     return 2;
   }
-  const auto result = eventflow::streaming_example::run(argv[1], argv[2]);
+  const auto result = argc == 5 ? eventflow::native_udf_example::verify_restore(argv[1], argv[2])
+                                : eventflow::native_udf_example::run(argv[1], argv[2], argv[3]);
   if (!result.ok()) {
     std::cerr << "Streaming database verification failed: " << result.message() << '\n';
     return 1;

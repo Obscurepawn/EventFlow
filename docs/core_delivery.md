@@ -1,26 +1,28 @@
 # EventFlow 核心集群运行手册
 
-完整入口是[数据库主动消费示例](../examples/streaming_database/README.md)：独立声明六字段新闻表、两层物化视图和两个 Trigger，启动集群，向 HTTP 消息服务写入数据，再用 SQL 观察结果。消息消费、Clock 推进和函数完成均由数据库服务负责。此手册解释配置与运行边界；本轮验收状态以[当前规格](../specs/news-streaming-example.md)为准，历史测试结果不代替本轮验证。
+当前默认完整用法是 [SDK 上传 UDF 的流式示例](../examples/streaming_database/README.md)；本文中保留的静态模块代码参考已移到 [static_streaming](../examples/static_streaming/README.md)。原生上传与分发的最新范围见 [生产 UDF 规格](../specs/native-udf-delivery.md)。
+
+完整入口是[数据库主动消费示例](../examples/static_streaming/README.md)：独立声明六字段新闻表、两层物化视图和两个 Trigger，启动集群，向 HTTP 消息服务写入数据，再用 SQL 观察结果。消息消费、Clock 推进和函数完成均由数据库服务负责。此手册解释配置与运行边界；本轮验收状态以[当前规格](../specs/news-streaming-example.md)为准，历史测试结果不代替本轮验证。
 
 ## 一条命令运行完整流程
 
 在仓库根目录执行：
 
 ```sh
-bash examples/streaming_database/run.sh
+bash examples/static_streaming/run.sh
 ```
 
-脚本构建并使用三个程序：`eventflow_streaming_database` 提供数据库的三个角色，`eventflow_message_server` 提供独立消息设施，`eventflow_streaming_verify` 生产数据并验证 SQL。需要复用构建目录时：
+脚本构建并使用三个程序：`eventflow_static_streaming_database` 提供数据库的三个角色，`eventflow_message_server` 提供独立消息设施，`eventflow_static_streaming_verify` 生产数据并验证 SQL。需要复用构建目录时：
 
 ```sh
-bash examples/streaming_database/run.sh build-debug
+bash examples/static_streaming/run.sh build-debug
 EVENTFLOW_BUILD_DIR="$PWD/build-debug" EVENTFLOW_SKIP_BUILD=1 \
-  bash examples/streaming_database/run.sh
+  bash examples/static_streaming/run.sh
 ```
 
 新构建目录使用 Clang、Debug、Unix Makefiles；项目依赖来自 `cpp3rdlib/`，构建不下载第三方实现。Debug 启用 ASan/UBSan/LSan 的失败诊断；Release 使用 `-O3`、`NDEBUG` 和可用 LTO，不启用 sanitizer 或 fast-math。`EVENTFLOW_SKIP_BUILD=1` 只适用于已构建的对应二进制。
 
-脚本自动分配端口，打印服务地址和工作目录，保留配置、日志和 RocksDB 活动数据目录，有限流程结束后回收子进程。运行包没有 `CMakeLists.txt` 时直接使用包内 `bin/`。完整构建方法见[根 README](../README.md)，业务定义和逐条断言见[示例 README](../examples/streaming_database/README.md)。
+脚本自动分配端口，打印服务地址和工作目录，保留配置、日志和 RocksDB 活动数据目录，有限流程结束后回收子进程。运行包没有 `CMakeLists.txt` 时直接使用包内 `bin/`。完整构建方法见[根 README](../README.md)，业务定义和逐条断言见[示例 README](../examples/static_streaming/README.md)。
 
 ## 进程与所有权
 
@@ -53,7 +55,7 @@ SQL client -> Coordinator -> owning Compute -> confirmed relations
 
 ## 自定义静态计算定义
 
-[definition.cpp](../examples/streaming_database/definition.cpp)在自己的 Catalog 中定义：
+[definition.cpp](../examples/static_streaming/definition.cpp)在自己的 Catalog 中定义：
 
 ```text
 news_updates -> news_stats -> news_features
@@ -68,13 +70,13 @@ news_updates -> news_stats -> news_features
 
 `news_stats` 按 ticker 维护新闻条数、情绪总和及 `SUM(sentiment_score * market_price)`；`news_features` 再计算平均情绪。`sentiment_threshold` 在新闻后检查条数至少为 2 且平均情绪至少为 0.5，每个 session 最多受理一次；`periodic_impact` 在已有 ticker 上每 200 ms 尝试一次请求。它们捕获受理时的新闻条数、平均情绪和情绪价格乘积合计，静态函数计算 `impact_score = sentiment_price_sum / news_count`。后续新闻不会修改旧请求的固定输入。
 
-`ComputationModule` 由稳定的 `name`、`version` 和 `bind` 工厂组成。工厂接收部署前 DDL，返回包含 Catalog、ProcessorConfig 和 FunctionRegistry 的完整 `BoundComputation`；`TriggerSet::bind` 校验并原子绑定定义。[main.cpp](../examples/streaming_database/main.cpp)把该模块传给 `database_main`，Coordinator 与所有 Compute 链接同一份模块并校验部署身份。
+`ComputationModule` 由稳定的 `name`、`version` 和 `bind` 工厂组成。工厂接收部署前 DDL，返回包含 Catalog、ProcessorConfig 和 FunctionRegistry 的完整 `BoundComputation`；`TriggerSet::bind` 校验并原子绑定定义。[main.cpp](../examples/static_streaming/main.cpp)把该模块传给 `database_main`，Coordinator 与所有 Compute 链接同一份模块并校验部署身份。
 
 这是随应用编译的自定义计算入口。修改 C++ Trigger、Schema 映射或静态函数后需要重新编译、部署相容定义；SDK `deploy()` 不上传 C++ 闭包。通用服务与 `ComputationRuntime` 不依赖示例业务；旧业务场景只作为测试支持材料保留。
 
 ## 消息订阅与服务配置
 
-完整配置由 [run.sh](../examples/streaming_database/run.sh)生成。Coordinator 的 `source` 配置形如：
+完整配置由 [run.sh](../examples/static_streaming/run.sh)生成。Coordinator 的 `source` 配置形如：
 
 ```json
 {
@@ -102,7 +104,7 @@ news_updates -> news_stats -> news_features
 {"ticker":"TICKER_0","timestamp_us":1700000000000001,"headline":"Product outlook improves","text_body":"Demand is improving for the next quarter.","sentiment_score":0.25,"market_price":100.0}
 ```
 
-HTTP publish 用 `key_hex`/`payload_hex` 传递原始字节，具体请求见 [verify.cpp](../examples/streaming_database/verify.cpp)。当前自动接入要求非空 payload，tombstone 不自动映射为删除。可选 `timestamp_ms` 转换为事件时间微秒，并检查溢出；没有时间戳时使用本轮处理时间。业务 Row 决定数据库路由，原始消息 key 不替代 Schema 校验。
+HTTP publish 用 `key_hex`/`payload_hex` 传递原始字节，具体请求见 [verify.cpp](../examples/static_streaming/verify.cpp)。当前自动接入要求非空 payload，tombstone 不自动映射为删除。可选 `timestamp_ms` 转换为事件时间微秒，并检查溢出；没有时间戳时使用本轮处理时间。业务 Row 决定数据库路由，原始消息 key 不替代 Schema 校验。
 
 ## 部署、自动消费和 SQL
 

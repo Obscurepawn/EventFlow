@@ -18,17 +18,17 @@ if [[ ${EVENTFLOW_SKIP_BUILD:-0} != 1 && -f "$repo_root/CMakeLists.txt" ]]; then
     configure_args+=(-DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug)
   fi
   "$cmake_binary" "${configure_args[@]}"
-  "$cmake_binary" --build "$build_dir" --target eventflow_streaming_database \
-    eventflow_message_server eventflow_streaming_verify --parallel "${EVENTFLOW_BUILD_JOBS:-4}"
+  "$cmake_binary" --build "$build_dir" --target eventflow \
+    eventflow_message_server eventflow_native_udf_verify eventflow_news_udf --parallel "${EVENTFLOW_BUILD_JOBS:-4}"
 fi
 
 binary_dir="$build_dir/bin"
 if [[ ! -f "$repo_root/CMakeLists.txt" ]]; then
   binary_dir="$repo_root/bin"
 fi
-database_bin=${EVENTFLOW_DATABASE_BINARY:-"$binary_dir/eventflow_streaming_database"}
+database_bin=${EVENTFLOW_DATABASE_BINARY:-"$binary_dir/eventflow"}
 source_bin=${EVENTFLOW_MESSAGE_BINARY:-"$binary_dir/eventflow_message_server"}
-verify_bin=${EVENTFLOW_DEMO_BINARY:-"$binary_dir/eventflow_streaming_verify"}
+verify_bin=${EVENTFLOW_DEMO_BINARY:-"$binary_dir/eventflow_native_udf_verify"}
 for executable in "$database_bin" "$source_bin" "$verify_bin"; do
   if [[ ! -x "$executable" ]]; then
     printf 'Missing executable: %s\n' "$executable" >&2
@@ -41,7 +41,7 @@ export ASAN_OPTIONS=${ASAN_OPTIONS-detect_leaks=1:halt_on_error=1}
 export UBSAN_OPTIONS=${UBSAN_OPTIONS-halt_on_error=1:print_stacktrace=1}
 export LSAN_OPTIONS=${LSAN_OPTIONS-exitcode=23}
 export LD_LIBRARY_PATH="$repo_root/cpp3rdlib/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-work_dir=$(mktemp -d "${TMPDIR:-/tmp}/eventflow-streaming-XXXXXX")
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/eventflow-native-udf-XXXXXX")
 pids=()
 labels=()
 
@@ -69,7 +69,7 @@ cleanup() {
       failed=1
     fi
   done
-  printf 'Streaming example logs/configuration/data: %s\n' "$work_dir"
+  printf 'Native UDF example logs/configuration/data: %s\n' "$work_dir"
   if ((result == 0 && failed != 0)); then result=1; fi
   exit "$result"
 }
@@ -110,25 +110,59 @@ launch() {
 printf 'Configuration and logs: %s\n' "$work_dir"
 launch HTTP_MESSAGE_SOURCE_READY messages "$source_bin" --port 0
 source_port=$ready_port
-launch EVENTFLOW_KV_READY kv "$database_bin" kv --backend rocks --port 0 --shards 3 \
-  --data-dir "$work_dir/kv-data"
+start_database() {
+  local restoring=$1
+  local restore_checkpoint=""
+  local kv_args=(kv --backend rocks --port 0 --shards 3 --data-dir "$work_dir/kv-data")
+  if [[ $restoring == true ]]; then
+    restore_checkpoint="native-cut"
+    kv_args=(kv --backend rocks --port 0 --shards 3 --data-dir "$work_dir/kv-restored"
+      --restore-from "$work_dir/kv-data" --snapshot "$restore_checkpoint")
+  fi
+launch EVENTFLOW_KV_READY kv "$database_bin" "${kv_args[@]}"
 kv_port=$ready_port
 cat >"$work_dir/compute-a.json" <<JSON
-{"node_id":"compute-a","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"shards":[0]}
+{"allow_native_udfs":true,"node_id":"compute-a","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"shards":[0]}
 JSON
 cat >"$work_dir/compute-b.json" <<JSON
-{"node_id":"compute-b","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"shards":[1]}
+{"allow_native_udfs":true,"node_id":"compute-b","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"shards":[1]}
 JSON
 launch EVENTFLOW_COMPUTE_READY compute-a "$database_bin" compute --config "$work_dir/compute-a.json"
 a_port=$ready_port
 launch EVENTFLOW_COMPUTE_READY compute-b "$database_bin" compute --config "$work_dir/compute-b.json"
 b_port=$ready_port
 cat >"$work_dir/meta.json" <<JSON
-{"cluster_id":"streaming-news","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"tick_interval_ms":20,"nodes":[{"node_id":"compute-a","endpoint":"http://127.0.0.1:$a_port","shards":[0]},{"node_id":"compute-b","endpoint":"http://127.0.0.1:$b_port","shards":[1]}],"source":{"type":"http","endpoint":"http://127.0.0.1:$source_port","source_id":"news_feed","relation":"news_updates","assignments":[{"topic":"news_updates","partition":0,"next_offset":"0"},{"topic":"news_updates","partition":1,"next_offset":"0"}],"poll_interval_ms":10,"max_message_bytes":262144}}
+{"allow_native_udfs":true,"restore_checkpoint":"$restore_checkpoint","cluster_id":"native-news","kv_endpoint":"http://127.0.0.1:$kv_port","port":0,"shard_count":2,"tick_interval_ms":20,"nodes":[{"node_id":"compute-a","endpoint":"http://127.0.0.1:$a_port","shards":[0]},{"node_id":"compute-b","endpoint":"http://127.0.0.1:$b_port","shards":[1]}],"source":{"type":"http","endpoint":"http://127.0.0.1:$source_port","source_id":"news_feed","relation":"news_updates","assignments":[{"topic":"news_updates","partition":0,"next_offset":"0"},{"topic":"news_updates","partition":1,"next_offset":"0"}],"poll_interval_ms":10,"max_message_bytes":262144}}
 JSON
 launch EVENTFLOW_COORDINATOR_READY meta "$database_bin" coordinator --config "$work_dir/meta.json"
 meta_port=$ready_port
+}
+start_database false
 printf 'Message service: http://127.0.0.1:%s\nMeta: http://127.0.0.1:%s\nKV data: %s/kv-data\n' \
   "$source_port" "$meta_port" "$work_dir"
-"$verify_bin" "http://127.0.0.1:$meta_port" "http://127.0.0.1:$source_port" |
+"$verify_bin" "http://127.0.0.1:$meta_port" "http://127.0.0.1:$source_port" "${EVENTFLOW_UDF_LIBRARY:-$binary_dir/../lib/libeventflow_news_udf.so}" |
   tee "$work_dir/verify.log"
+
+# Stop all database processes while keeping the retained HTTP message log alive.
+for ((index=${#pids[@]}-1; index>=1; --index)); do
+  pid=${pids[index]}
+  kill -TERM "$pid"
+  for ((attempt=0; attempt<600; ++attempt)); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    printf 'Database process failed to stop for restore.\n' >&2
+    exit 1
+  fi
+  wait "$pid"
+  printf 'Checkpoint stop %s exit=0\n' "${labels[index]}"
+  cp "$work_dir/${labels[index]}.log" "$work_dir/${labels[index]}-before-restore.log"
+done
+pids=("${pids[0]}")
+labels=("${labels[0]}")
+cp "$work_dir/meta.json" "$work_dir/meta-before-restore.json"
+start_database true
+# No local UDF is available to this restore invocation: code must come from KV.
+"$verify_bin" "http://127.0.0.1:$meta_port" "http://127.0.0.1:$source_port" \
+  /unavailable/user-function.so restore | tee "$work_dir/restore-verify.log"

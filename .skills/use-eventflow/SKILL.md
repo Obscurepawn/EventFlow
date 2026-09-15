@@ -1,6 +1,6 @@
 ---
 name: use-eventflow
-description: Build applications with EventFlow's C++ feature-computation database, including SQL materialized views, Trigger and Pattern rules, static functions, database-managed message consumption, cluster deployment and SQL queries, and checkpoint recovery. Use when a task consumes EventFlow APIs or adapts its examples; kernel development and general streaming research are outside this skill's focus.
+description: Build applications with EventFlow's C++ feature-computation database, including SQL materialized views, SDK-uploaded C++ UDFs, submitted Trigger rules, database-managed message consumption, cluster deployment and SQL queries, and checkpoint recovery. Use when a task consumes EventFlow APIs or adapts its examples; kernel development and general streaming research are outside this skill's focus.
 ---
 
 # Use EventFlow
@@ -13,8 +13,9 @@ In this repository, the checkout root is two directories above this file. If the
 
 | User needs | Entry point | Read next |
 | --- | --- | --- |
-| Custom schemas and continuously maintained features | `Catalog`, SQL, `Engine`, `ComputationModule` | [Relational and execution APIs](references/relational-api.md) |
-| Custom event/condition/Clock/CEP logic and calculations | `Trigger`, `Pattern`, static `Function`, `TriggerSet::bind`, `EventProcessor` | [Trigger and typed-function APIs](references/trigger-api.md) |
+| Custom schemas and continuously maintained features | `SubmittedComputation.ddl`, SQL materialized views | [Relational and execution APIs](references/relational-api.md) |
+| Uploaded functions with source conditions or Clock | `register_udf`, `SubmittedTrigger`, `FunctionRef` | [Uploaded UDF example](../../examples/streaming_database/README.md) |
+| Embedded C++ or advanced Pattern APIs | `Trigger`, `Pattern`, `TriggerSet::bind`, `EventProcessor` | [Trigger and typed-function APIs](references/trigger-api.md) |
 | Operate a running cluster from C++ or HTTP | `ClusterClient`, Coordinator/Meta | [Cluster and operations](references/cluster-and-operations.md) |
 | Implement a complete streaming database application | Adapt `examples/streaming_database` | [Feature recipes](references/recipes.md) |
 | List historical trigger names, timestamps and request identities | Built-in `trigger_audit`, queried with SQL | [Trigger audit](references/trigger-audit.md) |
@@ -24,8 +25,8 @@ Load only the relevant references. Public declarations under `include/eventflow/
 ## Build the application
 
 1. Identify business key, base schema, row identity, source delivery identity, MV dependencies, trigger, and desired result. Ask only for business choices that cannot be inferred.
-2. For a custom cluster definition, provide a static `ComputationModule` with stable name/version and a `bind` factory returning `BoundComputation`; pass it to `database_main` in an application executable linked by all service roles. Embedded Engine/EventProcessor remains available. The SDK controls deployment and startup DDL; it does not upload C++ callbacks.
-3. Define base tables before dependent MVs. For computed requests, install an explicit candidate/session policy and bind the triggers atomically. Use `BoundComputation`'s returned Catalog, definition and registry together.
+2. For the normal cluster workflow, compile a C++ UDF into a shared library using the same SDK/toolchain as the server. Start generic `eventflow` processes with native UDF upload enabled, call `ClusterClient::register_udf`, construct a `SubmittedComputation` referencing the returned function version, then call `submit_computation` and `deploy`. This applies before the first deployment. Use `examples/static_streaming` only when the user requests the compiled-module or embedded API route.
+3. Define base tables before dependent MVs. Submitted definitions specify session_lifetime_us, source conditions or every_us, capture_relation/capture_fields and the function reference. The server validates and builds the Catalog and request state together. For advanced embedded APIs, use BoundComputation's returned Catalog, definition and registry together.
 4. For the normal cluster workflow, configure a `SourceSubscription`: Coordinator owns SourcePoller, durable-input ACK, time advancement and function completion. Producers publish raw messages; clients deploy and query. If using an embedded owner directly, supply its execution loop explicitly. A builder or SQL read alone does not execute a model.
 5. Query materialized results with a business-key scope, and inspect persistent request records when verifying admission, fixed inputs or Latest selection. Start from the complete `examples/streaming_database/run.sh` and its independent definition. Use the consumer CMake template only when a separate application directory is required.
 
@@ -51,6 +52,6 @@ Verify the business-specific outcome, not just process startup: include a positi
 
 ## Current capability boundary
 
-Static typed functions are compiled into the application. Dynamic UDF/UDTF/UDAF upload, Process Function, arbitrary remote job submission/unregister, online DDL/graph migration, HA, MVCC and cross-key computation are not delivered interfaces. MemMock, HTTP and Kafka implement the same IMessageSource contract used by SourcePoller. The CLI supports HTTP/Kafka subscriptions; the complete example uses an independent HTTP message server. Kafka retains static manual assignment, and real broker/Compose validation remains separate. Offer an implemented route or state the missing capability instead of inventing an API.
+Native C++ UDF upload and structured computation submission are the default example workflow; see examples/streaming_database/README.md and specs/native-udf-delivery.md. Upload and submission are limited to STAGING before the first deployment. Functions run in the Compute process with a matching C++ ABI; only trusted, deterministic, bounded code is supported. Shared KV stores the original library bytes and registration metadata, and Compute reads them during deployment or recovery. Compiled modules and embedded APIs remain separate reference routes. Full UDTF/UDAF families, Process Function, arbitrary remote job lifecycle, online DDL/graph migration, HA, MVCC and cross-key computation are not delivered interfaces. MemMock, HTTP and Kafka implement the same IMessageSource contract used by SourcePoller. The CLI supports HTTP/Kafka subscriptions; the complete example uses an independent HTTP message server. Kafka retains static manual assignment, and real broker/Compose validation remains separate. Offer an implemented route or state the missing capability instead of inventing an API.
 
 Return the chosen integration mode, concrete code/run command, relevant semantic assumptions and actual verification outcome. Keep deployment addresses and runtime budgets separate from business computation definitions.

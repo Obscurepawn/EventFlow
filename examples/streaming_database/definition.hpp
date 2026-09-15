@@ -1,10 +1,9 @@
 #pragma once
 
-#include "eventflow/computation_runtime.hpp"
+#include "eventflow/submitted_computation.hpp"
 
-namespace eventflow::streaming_example {
+namespace eventflow::native_udf_example {
 
-// Every database process links this same application-owned static definition.
-ComputationModule computation_module() noexcept;
+SubmittedComputation computation_definition(const FunctionRef& function) noexcept;
 
-} // namespace eventflow::streaming_example
+} // namespace eventflow::native_udf_example

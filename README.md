@@ -1,6 +1,6 @@
 # EventFlow
 
-EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**。它接收持续到来的流式数据，用 SQL 物化视图更新特征；条件满足或定时器到期时，再按声明式 Trigger / Pattern 发起计算。保存的特征结果可以通过 SQL 查询。在设计之初，就设计成分布式系统，让系统具备具备水平扩容能力来处理超大规模数据集的能力。
+EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**。它接收持续到来的流式数据，用 SQL 物化视图更新特征；条件满足或定时器到期时，再按声明式 Trigger / Pattern 发起计算。保存的特征结果可以通过 SQL 查询。系统按业务 key 分配数据，多个 Compute 可以分别处理不同分片。
 
 系统用两类依赖描述业务：**特征依赖决定先算什么后算什么，触发规则决定何时计算**。**前者通过级联物化视图表达计算图。后者组合事件条件、顺序和时钟，本质上是一个状态机，状态机本质上是由节点（状态）和有向边（转换条件）构成的有向图**。两者放在同一个系统内，便于管理计算定义、状态和结果。设计参考了 Flink 的CEP处理与 RisingWave 的持续物化视图维护机制。我的调研过程见[**调研文档**](docs/research.md)。
 
@@ -8,7 +8,7 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 
 对于这个TakeHome Project，后续我选择把这个Project做成数据库语义，因为我个人认为未来流式数据库取代流式计算框架是大势所趋，除此之外，做成数据库语义支持基于SQL对状态进行查询（这恰好是Flink这种系统的不足，虽然在早期有Queryable State，但是后续因为性能问题、Qos无法控制等原因也Deprecated了），整个系统的可观测性会好非常多。
 
-目前计算逻辑仅支持通过物化视图DDL和用户自定义计算逻辑和数据库内核联合编译来自定义（**跟Flink/Spark等计算框架类似，需要定义计算逻辑后编译，然后也无法热插拔**），尚不支持UDF、WASM、Lua等灵活的自定义计算逻辑的能力，但在设计空间上是预留了足够的这种用户自定义计算逻辑的空间，扩展只是一个工程工作量的问题，并不会存在很大无法解决的工程困难，毕竟这种动态热插拔的逻辑实际上在SQLite、Clickhouse、RisingWave这种成熟数据库系统中已经做得很好了，有非常典型的best practice可以借鉴。
+自定义计算逻辑可以直接写成 C++ UDF。把函数编译为 `.so` 后，通过 SDK 上传到已经启动的 Server，再提交表、物化视图和触发规则，调用 `deploy()` 开始运行。Compute 会加载这个 `.so`，在线程池中执行函数。文件和版本信息保存在共享 KV 中，数据库从 checkpoint 恢复时也能重新加载。目前只能在首次部署前提交这些内容，还不能修改运行中的计算图或替换函数。
 
 可以在自己的 C++ 进程中include引入EventFlow的核心组件使用，也可以部署一个 Coordinator、一个Shared KV Service 和多个 Compute。当前按业务 key 静态分片，支持有限 SQL、条件与定时触发、有限时间内的事件序列匹配（CEP）、函数依赖图、选定成功结果（Latest）的查询和一致恢复点（checkpoint）。具体如何部署、使用这个数据库服务，可以见下方说明。
 
@@ -17,13 +17,14 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 其实我在这个take home project非常想做一个production ready的产品，而不是只是做一个embedded library的toy project runtime，但确实时间有限，因为担心影响招聘进度，到目前这个程度就先提交了。如果有足够长的时间继续迭代，我后续规划的演进迭代中会有：
 
 - 支持online ddl定义物化视图，从而支持流式计算的动态图
-- 基于udf/udtf/udaf/wasm/lua/pybind ffi的动态热插拔计算逻辑，**让投研可以动态定义计算逻辑而不需要停机或重新编译release产物**
+- 在已实现的原生 C++ UDF 上传与首次部署基础上，继续支持运行中切换计算定义、完整 UDTF/UDAF 和其他语言执行后端；在线迁移还需要处理已有状态与在途请求。
 - 支持控制面作为配置中心，支持配置可热更新
 - 支持Ray作为调度Runtime，从而能支持CPU/GPU的hybrid调度，从而能在计算层做一些Model Inference的工作
 - Ai Coding年代，复杂系统使用Rust构建的话，从包管理、项目构建和正确性约束上来说相比C++来说都会更有优势。不过此处为了reviewer能更好地看懂当前代码，先使用project reviewer大概率都更熟悉的C++技术栈
 - 支持高可用机制，可以应付各种常见的Failover，提高系统稳定性
 - 提供SQL ORM替代Raw SQL String，可以通过命令式API拼出一条SQL，降低使用者通过SQL查询Feature值和定义Materialize View的难度
 - 让EventFlow变得更加cloud-native化
+  - UDF/UDAF/UDTF的动态链接库持久化保存在S3中，不直接作为KV保存（现有持久化方式是直接写到KV中）
   - 底层KV不依赖于本地盘，只写MemTable，将Message Delivery系统中的Message作为可靠Redo日志，随后只需要定期Flush Memtable到S3等云上组件即可
   - 组件尽量解耦，让每个地方可以用不同的实例规格（不同的模块实际上对于核存比、本地盘的需求都会不同），足够cloud native的产品需要做到完全按需扩缩容，降低资源碎片带来的浪费
 - 做完整的性能benchmark、在分布式场景下与各个开源组件pk一下
@@ -54,17 +55,54 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 
 ## 快速开始
 
-从仓库根目录运行完整的[流式数据库示例](examples/streaming_database/README.md)：
+从仓库根目录运行 [一个通过udf自定义计算逻辑的流式计算任务Demo](examples/streaming_database/README.md)：
 
 ```sh
-./examples/streaming_database/run.sh
+bash examples/streaming_database/run.sh
 ```
 
-源码构建需要 Linux x86_64、兼容随包库的运行环境，以及 Clang、CMake 和 Make；环境准备见[编译](#编译)。示例脚本负责构建和启动 **1 个独立 HTTP 消息服务、1 个 KV、1 个 Coordinator 和 2 个 Compute**，随后生产消息并用 SQL 检查计算结果。
+源码构建需要 Linux x86_64、兼容随包库的运行环境，以及 Clang、CMake 和 Make；环境准备见[编译](#编译)。脚本启动 **1 个独立 HTTP 消息服务、1 个 Rocks KV、1 个 Coordinator 和 2 个 Compute**，随后通过 SDK 上传 `.so`、提交计算定义并部署，用 SQL 检查结果，再从 checkpoint 重启数据库进程并继续计算。
 
-这条链路展示数据库的日常使用方式：**先定义表、级联 MV 和 Trigger，部署编译好的计算定义，再向消息源生产数据，由数据库持续拉取和计算，最后查询结果。** 追加输入后，计算仍由数据库内部运行循环推进；客户端生产消息和读取 SQL 结果，不调用 `ingest`、`pump` 或 `drain` 来替数据库执行这条链路。
+示例验证两个 shard 的阈值结果 `51.5`、`128`，追加新闻后的周期结果 `53`，以及恢复后使用 KV 中的原始 UDF 得到 `54.75`。客户端不调用 `ingest`、`pump` 或 `drain` 来替数据库推进这条链路；恢复时消息服务保持运行，不代表消息服务自身的宕机恢复。
+
+## 通过 SDK 提交 UDF 与计算定义
+
+完整代码分为两部分：用户函数见 [news_impact.cpp](examples/cpp_udf/news_impact.cpp)，可提交的业务定义见 [streaming_database/definition.cpp](examples/streaming_database/definition.cpp)。前者单独编译为 `.so`；后者使用 `SubmittedComputation`、`SubmittedTrigger` 和有类型的条件描述表、级联 MV、session、当前字段 capture 与请求。Server 使用通用 `eventflow` 程序，业务实现由上传的函数包提供。
+
+下面片段位于返回 `Status` 的 `noexcept` 函数内，使用 `eventflow` 命名空间，并包含公开 `cluster_client.hpp` 与该示例的 `definition.hpp`：
+
+```cpp
+EF_ASSIGN_OR_RETURN(auto client, ClusterClient::open(meta_endpoint));
+EF_ASSIGN_OR_RETURN(auto function, client->register_udf(library_path));
+auto definition = native_udf_example::computation_definition(function);
+EF_ASSIGN_OR_RETURN(auto staged, client->submit_computation(definition));
+EF_ASSIGN_OR_RETURN(auto deployed, client->deploy());
+```
+
+| 步骤 | 实际行为 |
+| --- | --- |
+| `register_udf` | 上传 `.so`，检查它能否在当前 Server 上加载，保存文件及函数版本，返回 `FunctionRef` |
+| `submit_computation` | 提交表、MV 和触发规则，检查字段类型与函数参数是否匹配；检查失败时保留原来的定义 |
+| `deploy` | 各 Compute 从 KV 读取并加载 `.so`；所有节点准备好后，数据库开始消费消息 |
+| SQL / checkpoint | 用 SQL 查看结果；checkpoint 保存恢复所需的数据、处理进度和 UDF 文件，恢复时不用重新上传 |
+
+### UDF 怎么到达 Compute 节点？
+
+上传后的 `.so` 保存在共享 KV 中。部署时，Coordinator 告诉各个 Compute 要运行什么计算、使用哪个函数版本。Compute 再从 KV 读取对应的 `.so`，检查 SHA-256 和 C++ ABI，确认文件内容及编译环境匹配后加载。函数运行时直接使用内存里已经加载的代码，不会每收到一条消息就下载一次文件。
+
+数据库从 checkpoint 恢复时，也会从 KV 重新读取 `.so`，所以不需要客户端再次上传。现在还没有单独做节点级文件缓存，部署检查和每个分片初始化时可能分别读取。相关代码见 [Coordinator](src/service/coordinator_service.cpp)、[Compute](src/service/compute_service.cpp)、[读取 UDF 文件](src/runtime/submitted_computation.cpp)和[加载共享库](src/runtime/udf.cpp)。
+
+<p align="center">
+  <img src="docs/image/eventflow-udf-deployment.png" alt="服务启动后的首次部署时序：SDK 上传 UDF、原子保存 UDF 文件、提交并绑定计算定义、Compute 从 KV 加载并确认安装" width="1100">
+</p>
+
+上传函数和提交规则后，还需要调用 `deploy()` 才会开始计算。同一个函数 ID/version 不能换成另一个文件；修改函数时应使用新版本。如果写入 KV 的结果暂时不确定（`UNKNOWN`），系统会先确认上一次写入是否成功。
+
+默认不允许上传原生代码。使用时，Coordinator 和 Compute 都要设置 `allow_native_udfs: true`，示例脚本已经配好。UDF 与 Server 需要使用相同的 SDK 和兼容的 C++ 编译环境；每个 `.so` 最多 **1 MiB**，最多注册 **16 个函数版本**。函数直接在 Compute 进程中运行，因此只应上传可信、计算结果确定且能在有限时间内返回的代码。当前 SDK 支持消息条件、Clock 和 `capture_current`，暂不支持远程提交 Pattern / `capture_match`。具体说明见 [示例 README](examples/streaming_database/README.md)。
 
 ## 完整使用流程
+
+以下完整流程对应 `examples/streaming_database` 的上传版：编写 UDF，声明新闻特征与触发规则，启动集群后通过 SDK 注册、提交和部署。
 
 ### 先看示例：数据 Schema、业务 case 与计算图
 
@@ -87,7 +125,7 @@ EventFlow 是一个用 C++20 编写的**分布式特征计算流式数据库**�
 
 我们为每个标的维护新闻条数 `news_count`、平均情绪 `average_sentiment`，以及情绪与新闻时点价格乘积的合计 `sentiment_price_sum`。第一层 `news_stats` 计算新闻条数、情绪总和及 `SUM(sentiment_score * market_price)`；第二层 `news_features` 再由情绪总和除以新闻条数，得到平均情绪。
 
-静态函数随后计算演示用的新闻影响指标 **`impact_score = sentiment_price_sum / news_count`**，即逐条新闻的“情绪分数 × 当时价格”的平均值：
+上传的 UDF 随后计算演示用的新闻影响指标 **`impact_score = sentiment_price_sum / news_count`**，即逐条新闻的“情绪分数 × 当时价格”的平均值：
 
 - **情绪阈值 `sentiment_threshold`**：新闻到来后，表内至少有 `2` 条新闻、平均情绪 `>= 0.5`，且该标的的新闻会话有效、该会话尚未受理此规则的请求时，发起一次计算。受理时固定输入，同一会话最多受理一次。
 - **周期计算 `periodic_impact`**：为已出现的标的每 `200 ms` 安排一个时隙；会话有效时按当前特征尝试发起计算，输入未就绪则跳过。它独立于情绪阈值规则，延迟时隙可能合并。
@@ -114,17 +152,17 @@ flowchart TB
         features["news_features - MV<br/>news_count, average_sentiment<br/>sentiment_price_sum"]
         news --> totals --> features
     end
-    session["news_session<br/>Opened by the first news per ticker"]
+    session["news_scoring_session<br/>First news opens a 30-minute session"]
     subgraph threshold_job[" "]
         threshold["sentiment_threshold<br/>News event; news_count >= 2<br/>average_sentiment >= 0.5<br/>Active session; not yet admitted"]
-        threshold_input["threshold_impact_request<br/>capture_current at admission<br/>Frozen NewsFeatureSnapshot"]
+        threshold_input["sentiment_threshold_request<br/>capture_current at admission<br/>Frozen Row: ticker, news_count<br/>sentiment_price_sum"]
         threshold_score["news_impact / calculate_news_impact<br/>impact_score = sentiment_price_sum<br/>/ news_count<br/>Result for the threshold request"]
         threshold -. "Wait / once per session" .-> threshold_input
         threshold_input --> threshold_score
     end
     subgraph periodic_job[" "]
         periodic["periodic_impact<br/>200 ms Clock AND active session<br/>Independent of the threshold rule"]
-        periodic_input["periodic_impact_request<br/>capture_current at admission<br/>Frozen NewsFeatureSnapshot"]
+        periodic_input["periodic_impact_request<br/>capture_current at admission<br/>Frozen Row: ticker, news_count<br/>sentiment_price_sum"]
         periodic_impact["news_impact / calculate_news_impact<br/>impact_score = sentiment_price_sum<br/>/ news_count<br/>Result for each periodic request"]
         periodic -. "TryOnceAtFiring" .-> periodic_input
         periodic_input --> periodic_impact
@@ -147,7 +185,7 @@ flowchart TB
     class threshold_score,periodic_impact result;
 ```
 
-两条 Trigger 都触发同一个静态计算函数 `calculate_news_impact`，但各自创建请求、固定输入并保存结果；图中两个绿色节点表示两类请求的独立计算。MV 随新闻持续更新，影响指标函数在请求受理后执行。每次发出的触发还会记录到 `trigger_audit`，可用于后文的 SQL 查询；审计记录不依赖评分成功。
+两条 Trigger 都触发同一个已上传的 UDF `calculate_news_impact`，但各自创建请求、固定输入并保存结果；图中两个绿色节点表示两类请求的独立计算。MV 随新闻持续更新，影响指标函数在请求受理后执行。每次发出的触发还会记录到 `trigger_audit`，可用于后文的 SQL 查询；审计记录不依赖评分成功。
 
 #### 为什么用 MV 表达计算依赖，用 CEP 表达事件触发
 
@@ -166,147 +204,108 @@ EventFlow 因此把两类规则接在一起：**MV 持续维护特征，Trigger 
 
 下面再依次说明这些 Schema、MV 和 Trigger 如何通过代码定义，以及如何部署、输入数据和查询结果。
 
-### 1. 定义输入表、级联 MV 和 Trigger
+### 1. 编写 UDF 与可提交的计算定义
 
-先在[示例计算定义](examples/streaming_database/)中描述业务数据和计算规则：
+#### 1.1 把计算函数编译为独立 `.so`
 
-| 定义 | 需要表达什么 | 数据库如何使用它 |
-| --- | --- | --- |
-| 输入表 | 消息中的字段、类型和业务 key | 把源消息解码成关系数据，按 key 路由到负责的 Compute |
-| 第一层 MV | 对输入表执行投影、筛选或聚合 | 输入到来后增量维护基础特征 |
-| 后续 MV | 继续引用前面的 MV，组合特征和就绪条件 | 沿 Catalog 中的依赖顺序维护级联结果 |
-| 声明式 Trigger | 哪类事件、什么条件或哪个时钟周期允许发起计算 | 检查条件与会话，按规则创建计算请求 |
-| 静态计算函数与输入捕获 | 本次请求使用哪些固定输入、计算什么输出 | 保存受理时的输入，通过后台执行器完成函数计算 |
-| 结果查询 | 要读取哪些特征、成功结果和触发记录 | 使用 SQL 查看已保存的状态 |
-
-**MV 表达“算什么以及依赖什么”，Trigger 表达“何时发起一次计算”。** 更新 MV 不要求客户端按依赖逐步调用函数；用户通过声明式 Trigger API 绑定规则，也无需手工编写运行时状态转移。
-
-这些定义共同组成一个 `ComputationModule`，随示例数据库程序静态编译。Coordinator 与 Compute 使用相同的模块身份和 Catalog。修改 C++ 函数或 Trigger 后需要重新编译、重新部署；当前不支持通过 SDK 上传 C++ 闭包，也不支持动态 UDF、UDTF、UDAF 或热插拔插件。
-
-#### 1.1 用 SQL 定义物化视图
-
-下面沿用 [definition.cpp](examples/streaming_database/definition.cpp) 的新闻示例。代码位于返回 `StatusOr<BoundComputation>` 的 `bind_definition(...) noexcept` 工厂内，使用 `eventflow` 命名空间；`EF_ASSIGN_OR_RETURN` 在失败时提前返回错误状态 `Status`（由工厂的 `StatusOr<T>` 承载），在成功时取得结果。
+实际 UDF 见 [news_impact.cpp](examples/cpp_udf/news_impact.cpp)。输入通过 `FunctionInputs` 传递，结果通过 `StatusOr<Row>` 返回；该示例对输入形状、类型、计数与有限数值作显式检查：
 
 ```cpp
-EF_ASSIGN_OR_RETURN(auto catalog, Catalog::create());
-// This example identifies an article by (ticker, timestamp_us); repeated keys
-// update that article. The payload keeps full text and microsecond news time.
-EF_ASSIGN_OR_RETURN(auto news, catalog->define_sql(R"sql(
-  CREATE TABLE news_updates (
-    ticker STRING NOT NULL,
-    timestamp_us INT64 NOT NULL,
-    headline STRING NOT NULL,
-    text_body STRING NOT NULL,
-    sentiment_score FLOAT64 NOT NULL,
-    market_price FLOAT64 NOT NULL,
-    PRIMARY KEY (ticker, timestamp_us)
-  ) PARTITION BY (ticker)
-)sql"));
-// First MV: aggregate sentiment and retain the sentiment/price pairing per article.
-EF_ASSIGN_OR_RETURN(auto stats, catalog->define_sql(R"sql(
-  CREATE MATERIALIZED VIEW news_stats AS
-    SELECT ticker, COUNT(*) AS news_count, SUM(sentiment_score) AS total_sentiment,
-           SUM(sentiment_score * market_price) AS sentiment_price_sum
-    FROM news_updates GROUP BY ticker
-)sql"));
-(void)stats;
-// Second MV: derive mean sentiment from the current aggregate. COUNT is Int64,
-// so division explicitly casts it to Float64 instead of relying on coercion.
-EF_ASSIGN_OR_RETURN(auto features, catalog->define_sql(R"sql(
-  CREATE MATERIALIZED VIEW news_features AS
-    SELECT ticker, news_count,
-           total_sentiment / CAST(news_count AS FLOAT64) AS average_sentiment,
-           sentiment_price_sum
-    FROM news_stats
-)sql"));
+StatusOr<Row> calculate_news_impact(const FunctionInputs& inputs) noexcept {
+  if (inputs.size() != 1 || !inputs[0] || inputs[0]->size() != 3)
+    return Status(ErrorCode::InvalidArgument, "news impact requires one three-column input");
+
+  const auto& row = *inputs[0];
+  const auto* ticker = std::get_if<std::string>(&row[0]);
+  const auto* count = std::get_if<std::int64_t>(&row[1]);
+  const auto* weighted_sum = std::get_if<double>(&row[2]);
+  if (!ticker || !count || !weighted_sum || ticker->empty() || *count <= 0 ||
+      !std::isfinite(*weighted_sum))
+    return Status(ErrorCode::InvalidArgument,
+                  "news impact requires valid fields and positive count");
+
+  const double score = *weighted_sum / static_cast<double>(*count);
+  if (!std::isfinite(score))
+    return Status(ErrorCode::InvalidArgument, "news impact is not finite");
+
+  // The returned Row owns its string and numeric values; no borrowed plugin pointers escape.
+  return Row{*ticker, score};
+}
 ```
 
-`define_sql` 把关系注册到 Catalog，返回供后续 API 引用的 `RelationId`。依赖为 `news_updates → news_stats → news_features`；每条新闻输入沿依赖更新两级 MV，用户无需手动刷新。`news_count` 是整数，因此平均值计算显式使用 `CAST(news_count AS FLOAT64)`。
+除了计算函数，`.so` 还需要提供构建标识和 `UdfDefinition`，告诉 Server 函数的名称、版本，以及输入输出字段的类型；完整代码在同一文件。`extern "C"` 只固定入口符号名，业务参数与返回值仍是 C++ 对象。输出中的 `scored_ticker` 是 UDF 字段，结果关系的 `ticker` 由数据库维护为业务身份。
 
-#### 1.2 用声明式 API 定义 Trigger
+根 CMake 的 `eventflow_news_udf` 目标生成该 `.so`，`run.sh` 会先构建它。用户修改计算逻辑时编译新的函数包；通用 Server 不需要链接业务实现。当前接口上传已编译库，尚不提供任意源码编译或依赖自动分发。
 
-下面的片段继续使用 `news` 和 `features`。其中 `session` 是同一工厂通过 `Catalog::define_candidate` 定义的 `news_session`；`ProcessorConfig::requests->candidate` 在首条新闻时为该 ticker 激活会话。完整会话策略、类型和 `SchemaTraits` 映射见 [definition.cpp](examples/streaming_database/definition.cpp)。**调用 `.in_session(...)` 是引用已配置的会话，不会自行创建或续期会话。**
+#### 1.2 声明表、级联 MV、session 与 Trigger
 
-`capture_news_features` 将当前 MV 的新闻条数、平均情绪和情绪价格乘积合计映射为 `NewsFeatureSnapshot`，检查条数及 SQL 聚合列的可空值。`calculate_news_impact` 是返回 `StatusOr<NewsImpact>` 的 `noexcept` C++ 函数，计算 `sentiment_price_sum / news_count`，并检查分母和非有限结果。以下将它声明为静态 `Function`：
+[definition.cpp](examples/streaming_database/definition.cpp) 使用 `SubmittedComputation` 返回一份可序列化声明。参数 `function` 是 `register_udf` 返回的精确函数引用，以下代码使用 `eventflow` 命名空间：
 
 ```cpp
-using namespace std::chrono_literals;
-
-const auto news_event = EventRef::source({.kind = "news_updates", .payload_relation = news});
-const auto impact_function = Function<&calculate_news_impact>{
-    .id = "news_impact", .version = 1, .implementation_identity = "streaming.news_impact.v1"};
-
-// Evaluate the updated news features after each article for this ticker.
-const auto threshold =
-    Trigger::on_event("sentiment_threshold", news_event)
-        .implementation_identity("streaming.sentiment_threshold.v1")
-        .when((ViewRef(features).column<std::int64_t>("news_count") >= std::int64_t{2}) &&
-              (ViewRef(features).column<double>("average_sentiment") >= 0.5))
-        .in_session(SessionRef::candidate(session))
-        // Freeze the current features when the request is admitted.
-        .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
-        .request(impact_function, {.id = "threshold_impact_request",
-                                   .mode = RequestTriggerMode::Wait,
-                                   .pending_for = 1s,
-                                   .lifetime = 10s,
-                                   .once_per_candidate = true});
-
-// Database time drives one clock per observed ticker with an active session.
-const auto periodic =
-    Trigger::clock("periodic_impact", {.policy_id = "news_impact_clock",
-                                       .every = 200ms,
-                                       .phase = 0ms,
-                                       .event_kind = "news_clock"})
-        .implementation_identity("streaming.periodic_impact.v1")
-        .in_session(SessionRef::candidate(session))
-        .capture_current<&capture_news_features>(features, "streaming.capture_news_features.v1")
-        .request(impact_function, {.id = "periodic_impact_request",
-                                   .mode = RequestTriggerMode::TryOnceAtFiring,
-                                   .pending_for = 1s,
-                                   .lifetime = 10s,
-                                   .once_per_candidate = false});
+SubmittedComputation computation_definition(const FunctionRef& function) noexcept {
+  // These declarations travel over the SDK. The generic database binary has no business graph.
+  SubmittedComputation definition{
+      .name = "news_scoring",
+      .ddl =
+          {"CREATE TABLE news_updates(ticker STRING NOT NULL,timestamp_us INT64 NOT NULL,"
+           "headline STRING NOT NULL,text_body STRING NOT NULL,sentiment_score FLOAT64 NOT NULL,"
+           "market_price FLOAT64 NOT NULL,PRIMARY KEY(ticker,timestamp_us)) PARTITION BY(ticker)",
+           "CREATE MATERIALIZED VIEW news_stats AS SELECT ticker,COUNT(*) AS news_count,"
+           "SUM(sentiment_score) AS total_sentiment,SUM(sentiment_score*market_price) AS "
+           "sentiment_price_sum "
+           "FROM news_updates GROUP BY ticker",
+           "CREATE MATERIALIZED VIEW news_features AS SELECT ticker,news_count,"
+           "total_sentiment/CAST(news_count AS FLOAT64) AS average_sentiment,sentiment_price_sum "
+           "FROM news_stats"},
+      .input_relation = "news_updates",
+      .session_lifetime_us = 1800000000,
+      .triggers = {
+          {.name = "sentiment_threshold",
+           .function = function,
+           .capture_relation = "news_features",
+           .capture_fields = {"ticker", "news_count", "sentiment_price_sum"},
+           .conditions = {{.column = "news_count", .comparison = "ge", .value = std::int64_t{2}},
+                          {.column = "average_sentiment", .comparison = "ge", .value = 0.5}},
+           .every_us = 0,
+           .once_per_session = true},
+          {.name = "periodic_impact",
+           .function = function,
+           .capture_relation = "news_features",
+           .capture_fields = {"ticker", "news_count", "sentiment_price_sum"},
+           .conditions = {},
+           .every_us = 200000,
+           .once_per_session = false}}};
+  return definition;
+}
 ```
 
-| 声明 | 在此例中的含义 |
+三个 DDL 字符串依次定义 `news_updates → news_stats → news_features`。第一层聚合维护条数、情绪总和及情绪价格乘积合计，第二层派生平均情绪；COUNT 显式转为 FLOAT64 后参与除法。客户端把这些设置交给 `submit_computation`，Server 检查字段、依赖和函数引用，再生成运行时使用的计算图。
+
+| 声明 | 业务语义 |
 | --- | --- |
-| `on_event(...).when(...)` | 每条 `news_updates` 事件后读取同 ticker 的 MV，检查新闻条数 `>= 2` 且平均情绪 `>= 0.5`；这是条件判断，不自动表示阈值穿越 |
-| `in_session(...)` | 将请求绑定到该 ticker 的活动业务会话，期限及换代由 candidate policy 管理 |
-| `capture_current(...)` | 在请求受理时读取并固定输入；若等待后才受理，读取的是那时的 MV，后续新闻不会改写已固定的输入 |
-| `Wait` / `TryOnceAtFiring` | 前者可在 `pending_for` 内等待受理条件就绪；后者只尝试当前触发时隙，未就绪就跳过 |
-| `once_per_candidate` | `true` 表示同一会话中该 binding 最多受理一次；成功受理才消耗次数，计算随后失败也不会归还 |
-| `lifetime` | 请求受理后的执行期限，与等待受理的 `pending_for` 分开 |
-| `clock(..., .every = 200ms)` | 为已观察到的 key 安排周期时隙；活动会话允许时发起请求，过期时隙可能合并，不保证每 200 ms 完成一次计算 |
+| `function` | 固定 UDF 的 ID、version 和 SHA-256，不能在执行时隐式切换到另一实现 |
+| `capture_relation` / `capture_fields` | 请求受理时读取所声明视图的字段；这里固定 ticker、news_count、sentiment_price_sum |
+| `conditions` | 以 AND 组合当前视图字段与常量的比较；阈值规则检查新闻条数和平均情绪 |
+| `every_us = 0` | 源消息更新视图后检查该规则；可在 pending_us 内等待受理 |
+| `every_us = 200000` | 由数据库 Clock 每 200 ms 尝试受理；未就绪跳过，延迟时隙可以合并 |
+| `once_per_session` | 成功受理后消耗本 session 的次数；计算后来失败不会归还 |
+| `session_lifetime_us` | 每个 ticker 的首条新闻开启 30 分钟 session；到期后下一条源消息开启新 epoch，累计 MV 不清空 |
 
-上述阈值请求受理时的特征若为 `2、0.5、103`，影响指标就是 `51.5`。追加第三条新闻后，当前特征变为 `3、0.5、159`，周期请求可以得到 `53`；已受理的阈值请求仍保留原输入和 `51.5`。
+`pending_us` 默认 1 秒，`lifetime_us` 默认 10 秒，分别限制等待受理和受理后的请求期限。Clock 不会隐式开启 session，接口也不承诺每个时隙都完成一次计算。受理时如果当前特征是 `news_count=2、sentiment_price_sum=103`，函数得到 `51.5`；后续新闻改变 MV 不会修改该请求已保存的输入。
 
-#### 1.3 统一绑定计算定义
-
-链式 API 先描述规则，最后由 `TriggerSet::bind` 校验并装配。下面接在同一工厂末尾；`definition` 是已经配置 `input_relations` 和上述 candidate policy 的 `ProcessorConfig`，完整初始化见 [definition.cpp](examples/streaming_database/definition.cpp)。
-
-```cpp
-EF_ASSIGN_OR_RETURN(auto snapshot, catalog->snapshot());
-
-// Bind the SQL graph, triggers, captures, functions and requests as one definition.
-// The protected trigger_audit relation is installed automatically.
-return TriggerSet::bind(std::move(snapshot), std::move(definition), {threshold, periodic},
-                        {.shard_count = 2});
-```
-
-绑定结果包含 Catalog、函数 Registry 和运行定义；`bound.explain()` 可查看规则及生成关系，列名、类型、scope 和引用冲突在启动绑定时以状态错误返回。应用通过 `ComputationModule` 提供这个工厂，再由 [main.cpp](examples/streaming_database/main.cpp) 将模块传给 `database_main`。
-
-### 2. 启动消息服务和数据库集群
+### 2. 启动集群，上传 UDF 并部署定义
 
 `run.sh` 分别启动消息服务与数据库进程。HTTP 消息服务只保存和投递消息；Coordinator 管理部署、路由和持续消费，两个 Compute 处理各自负责的 key，KV 保存共享持久状态。
 
-部署阶段安装一致的表、MV 和计算定义。数据库进入运行状态后，Coordinator 托管的 `SourcePoller` 才开始持续消费。消息可以先写入 HTTP 服务，尚未部署的数据库不会提前确认这些消息。
+服务启动后还不知道要处理什么业务。客户端依次调用 `register_udf`、`submit_computation` 和 `deploy`，把函数、表和计算规则交给数据库。部署完成后，Coordinator 中的 `SourcePoller` 开始持续读取消息。消息可以先写入 HTTP 服务，尚未部署的数据库不会提前确认这些消息。
 
-节点地址、分片分配、内存预算和消息源地址属于运行配置；表、MV、Trigger 和函数属于计算定义。自定义业务时替换计算定义，集群仍使用同一套部署和路由机制。
+节点地址、分片分配、内存预算和消息源地址属于运行配置；表、MV、Trigger 和函数属于计算定义。自定义业务时通过 SDK 提交自己的定义和函数引用；集群仍使用同一套部署和路由机制。当前只允许首次部署前提交，不能直接覆盖运行中的图。
 
 ### 3. 向消息源生产数据
 
 示例客户端向独立 HTTP 消息服务追加数据。消息保留 source、topic、partition 和 offset，以便重试、去重和恢复。
 
-数据库中的 `HttpMessageSource` 通过 HTTP 拉取消息，`SourcePoller` 将其送入现有集群输入入口，再按业务 key 转发给 Compute。**消费位置由数据库在确认输入已持久提交后推进。** 提交状态为 UNKNOWN 时，保留原消息及身份继续确认；不可恢复的错误保留消费位置并暴露失败，不能先 ACK 再补算。
+数据库中的 `HttpMessageSource` 通过 HTTP 拉取消息，`SourcePoller` 将其送入现有集群输入入口，再按业务 key 转发给 Compute。**只有消息对应的数据写入成功后，数据库才会确认这条消息。** 如果写入结果为 UNKNOWN，就保留原消息，先确认这次写入的结果；如果处理失败，就停在当前位置并报告错误。
 
 HTTP 消息服务是便于本地运行的消息设施替身。它实现消息投递协议；真实 Kafka 集成属于独立的后续工作。消息适配接口统一为 `IMessageSource`，已有 MemMock、HTTP 和 Kafka 适配器，消息源的选择不改变表、MV 和 Trigger 的业务定义。
 
@@ -326,9 +325,9 @@ Compute 先按依赖更新基表和级联 MV，再检查相关 Trigger。符合�
 
 #### 5.1 SELECT 当前特征和触发记录
 
-`TriggerSet::bind` 会自动安装内置只读关系 **`trigger_audit`**，无需自行执行建表 DDL，也无需在用户函数中插入日志。每个实际发出的 occurrence 对应一行，与该轮触发状态一起原子提交；同一输入重放不会重复新增相同触发记录。
+Server 会自动创建只读的 **`trigger_audit`** 表，记录实际发出的触发事件。用户不用额外建表，也不用在 UDF 中写审计日志。触发记录和对应状态在同一批次写入 KV，同一条输入重放时不会重复记录。
 
-以下 `TICKER_0` 应替换为运行时实际输出的 ticker。业务表使用 `ticker`，审计表则统一使用 `scope_key_0`；复合业务 key 对应 `scope_key_0、scope_key_1、...`，具体映射可查 `bound.explain()["trigger_audit"]["scope_columns"]`。
+以下 `TICKER_0` 应替换为运行时实际输出的 ticker。业务表使用 `ticker`，审计表则统一使用 `scope_key_0`；复合业务 key 对应 `scope_key_0、scope_key_1、...`，具体映射可查 `staged["explanation"]["trigger_audit"]["scope_columns"]`。
 
 ```sql
 -- Read the current materialized features.
@@ -354,7 +353,7 @@ SELECT occurrence_id, scheduled_at_us, evaluated_at_us, skipped_slots, request_i
 | 字段 | 如何解读 |
 | --- | --- |
 | `occurrence_id` | 一次实际触发的稳定身份；同一规则的多次触发有不同身份 |
-| `rule_id` / `event_kind` | 例如 `sentiment_threshold` / `news_updates`，或 `periodic_impact` / `news_clock` |
+| `rule_id` / `event_kind` | 例如 `sentiment_threshold` / `news_updates`，或 `periodic_impact` / `periodic_impact_clock` |
 | `occurred_at_us` / `evaluated_at_us` | occurrence 的逻辑发生时间 / 实际评估时的 processing time，单位均为微秒；不是函数完成时间 |
 | `scheduled_at_us` / `skipped_slots` | Clock 的计划时隙 / 合并跳过的时隙数；普通 source 触发的计划时间为 NULL |
 | `request_id` / `binding_id` / `plan` | 关联请求身份、请求绑定及计算计划；未绑定请求的 Trigger 这些列为 NULL |
@@ -396,32 +395,32 @@ Status print_trigger_audit(std::string_view endpoint, const std::string& ticker)
 
 `audit.rows` 是已保存的触发记录，`audit.fields` 给出列名和类型；查询参数 `128` 和 `1024 * 1024` 分别是本次读取的行数与字节预算。当前 SQL 按单 key 读取，不支持通过省略 scope 来全局扫描；不保证时间排序，需要时在客户端按 `evaluated_at_us` 和 `occurrence_id` 排序。
 
-**审计行表示“已发出触发”，不表示“请求已受理”或“计算已成功”。** 已发出但仍在等待、或在 `TryOnceAtFiring` 中跳过的记录也会保留；仅仅条件不满足、once 已消费或没有活动会话而未发出的触发不会记行。需要追踪结果时，取出非 NULL 的 `request_id`，使用 `client->read_request(scope, request_id)` 查询请求状态；尚未受理或已跳过时可能返回 `NotFound`。计算结果关系名从 `bound.explain()` 和 Catalog 获取，完整读取方法见 [verify.cpp](examples/streaming_database/verify.cpp)。
+**审计行表示“已发出触发”，不表示“请求已受理”或“计算已成功”。** 已发出但仍在等待、或在 `TryOnceAtFiring` 中跳过的记录也会保留；仅仅条件不满足、once 已消费或没有活动会话而未发出的触发不会记行。需要追踪结果时，取出非 NULL 的 `request_id`，使用 `client->read_request(scope, request_id)` 查询请求状态；尚未受理或已跳过时可能返回 `NotFound`。计算结果表名可以从 `submit_computation` 返回的 `explanation` 和 Catalog 中找到，完整读取方法见 [verify.cpp](examples/streaming_database/verify.cpp)。
 
 审计历史有界：默认每个 scope 最多保留最近 **128 行**，且 KV key 加编码行的总大小不超过 **256 KiB**，超过任一限制会淘汰旧记录；消费触发 outbox 不会删除这些历史。时间和 offset 使用 `INT64`；`rule_version`、`skipped_slots`、`firing_revision` 等 UInt64 元数据以十进制字符串保存。需要长期审计时，应在记录被淘汰前自行导出。
 
-暂停、恢复和一致 checkpoint 用于控制正在运行的数据库。checkpoint 需要绑定源位置、Catalog 与运行时状态；KV snapshot 只是存储边界，不能单独作为完整恢复点。RocksDB WAL 仍然保留。
+可以通过 SDK 暂停、恢复消费或创建 checkpoint。checkpoint 会一起保存消息读到哪里、计算定义、运行状态和 UDF 文件；单独备份 KV 文件不足以说明这些内容处于同一个恢复点。RocksDB 仍保留 WAL。
 
 ## 系统结构
 
 <p align="center">
-  <img src="docs/image/eventflow-system-architecture.png" alt="EventFlow 系统架构：静态计算定义、消息拉取与确认、Coordinator、Compute 内部的 MV、Trigger、请求状态机、函数线程池、有界缓存及共享 KV" width="1100">
+  <img src="docs/image/eventflow-system-architecture.png" alt="EventFlow 系统架构：SDK 上传 UDF 并提交定义、消息拉取与确认、Coordinator、Compute 内部 MV、Trigger、请求和 UDF 线程池、缓存及保存 UDF 文件的共享 KV" width="1100">
 </p>
 
-图中的 `SourcePoller` 由 Coordinator 托管，通过 `IMessageSource` 主动拉取消息，输入持久确认后才 ACK；消息系统可以是 MQ，也可以是提供拉取接口的其他服务。当前完整示例使用 HTTP 消息服务。各 Compute 绑定并校验同一 `ComputationModule` 与 Catalog，分别负责不同 shard；图中展开 Compute A 的内部组件，Compute B 及其他实例具有相同结构。SQL 查询从客户端经 Coordinator 路由到对应 owner，读取已保存的物化结果。
+Coordinator 中的 `SourcePoller` 负责读取消息，按业务 key 找到对应的 Compute，并在数据写入成功后确认消息。图中展开了 Compute A 的内部组件，其他 Compute 的结构相同，各自处理分配给自己的数据。用户通过 SDK 提交计算规则和 UDF，各节点在部署时检查定义及函数版本是否一致；查询也由 Coordinator 转发到对应的 Compute。
 
 | 组件 | 职责 |
 | --- | --- |
-| 生产与查询客户端 | 向消息系统生产数据，通过 SQL 读取并检查结果 |
+| 客户端 | 上传 UDF、提交计算规则、部署；向消息系统写数据，用 SQL 查看结果 |
 | 消息系统（如 MQ） | 保存消息，提供读取、确认与重放位置；具体协议由 IMessageSource 适配 |
-| Coordinator / Meta | 安装 Catalog 与计算定义、管理路由，托管 SourcePoller，协调运行状态、水位和 checkpoint |
-| Compute / EventProcessor | 串行维护所属 shard 的基表、级联 MV、Trigger / CEP、会话、Timer 与触发审计 |
-| RequestRuntime / RequestMachine | 受理时固定输入，维护请求、节点、attempt 与 once 状态，推进依赖已经就绪的函数 |
-| 函数线程池 | 使用固定输入执行已编译函数，把完成结果返回同一 owner，由 owner 提交结果与后继状态 |
+| Coordinator / Meta | 检查并保存 UDF 和计算规则，通知 Compute 部署；负责消息消费、路由、水位和 checkpoint |
+| Compute / EventProcessor | 处理所属分片的数据，更新表和 MV，检查触发条件，维护会话、定时器和审计记录 |
+| RequestRuntime / RequestMachine | 保存每次计算的输入和进度，记录重试及执行次数，依赖准备好后交给函数线程池 |
+| UdfLibrary / 函数线程池 | 加载 `.so`，运行 UDF，把结果交回负责该分片的 owner 写入数据库；使用结束后才卸载库 |
 | CachedStateStore / RemoteStateStore | CachedStateStore 在节点预算内缓存已确认状态，校验 owner / epoch，UNKNOWN 时保留原批次并阻止绕过确认；下层 RemoteStateStore 负责 HTTP KV 调用 |
-| KV Service | 保存各业务 shard 和控制 shard 的状态，提供原子批、revision / receipt 和存储快照；RocksDB 后端保留 WAL |
+| KV Service | 保存业务数据、系统状态和 UDF 文件，提供原子写入、提交回执和快照；RocksDB 后端保留 WAL |
 
-源码中的嵌入式 C++ API 仍可供应用直接组合使用；完整示例展示的是独立部署的数据库服务。当前采用静态分片和已编译的计算定义，在线图迁移、动态扩展函数、Process Function 与 HA 继续保留为后续范围。
+当前分片在启动前分配，计算图在首次部署后固定。暂不支持运行中改图、完整 UDTF/UDAF、Process Function 或高可用。
 
 ### 消息处理、特征计算与 Trigger 状态维护
 
@@ -429,24 +428,24 @@ Status print_trigger_audit(std::string_view endpoint, const std::string& ticker)
   <img src="docs/image/eventflow-message-sequence.png" alt="消息处理时序：读取与路由、基表和级联 MV 更新、Trigger 状态推进、输入原子提交、请求受理、源 ACK、异步函数计算及结果提交" width="1100">
 </p>
 
-时序图按阶段展示消息处理与计算链路。`Compute owner`、`Trigger / CEP` 和函数执行器位于同一个 Compute 进程：前两者由同一 shard owner 协作维护状态，线程池只执行函数。读取当前视图、受理和领取任务涉及的细分 KV 往返作了合并；它们各自的提交边界仍然独立。图中把消息确认与后台计算分组展示；**当前实现的就绪成功路径先 submit，再返回输入确认并 ACK，ACK 无需等待函数完成。**
+下面是一条消息触发 UDF 计算的过程，假设触发后输入和执行额度都已准备好。`Compute owner`、`Trigger / CEP` 和函数执行器位于同一个 Compute 进程：前两者由同一 shard owner 协作维护状态，线程池只执行函数。读取当前视图、受理和领取任务涉及的细分 KV 往返作了合并；它们各自的提交边界仍然独立。**这个过程中先提交函数任务，再确认源消息（ACK）。** 线程池执行与源确认可以并行；图中 completion 位于 ACK 之后是一种可能的时序，ACK 不等待函数完成。即使请求还需要等待，已经写入成功的输入仍可以确认。
 
 1. **接收与更新特征**：保留消息的投递身份和处理时间，重投先去重；owner 先处理到期项，再更新基表与级联 MV。Trigger 使用本轮稳定的视图值检查条件，推进状态、会话、Timer 和待受理意图；实际发出的触发写入审计。
 2. **确认输入轮**：本轮关系变化、规则状态、Timer、触发记录与源进度同 shard 原子提交。遇到 `UNKNOWN`，保留原提交身份和完整批次，先确认结果再继续推进。
-3. **受理与执行请求**：满足就绪条件和额度后，受理轮保存固定输入、Request 和相关 once 状态；任务被持久领取并确认后才交给函数线程池。`capture_current` 在受理时读取特征，`capture_match` 保留匹配事件。条件不满足时不会发出触发；已经发出的请求意图可能按 `Wait` 等待，或按 `TryOnceAtFiring` 跳过。
+3. **受理与执行请求**：满足就绪条件和额度后，受理轮保存固定输入、Request 和相关 once 状态；任务被持久领取并确认后才交给函数线程池。原生路径调用部署时已加载的 `.so`，不在每次请求时重新上传或下载；`capture_current` 在受理时读取声明字段。条件不满足时不会发出触发；已经发出的请求意图可能按 `Wait` 等待，或按 `TryOnceAtFiring` 跳过。
 4. **ACK 与结果提交**：Coordinator 保存输入进度，SourcePoller 再确认原 token。**ACK 只依赖输入已确认，不要求后台函数已完成；就绪或额度不足也不会撤销已经确认的输入。** 完成结果返回 owner，再以独立原子轮提交结果、请求状态与后继就绪记录，供 SQL 查询。
 
 Clock / Timer 也能由数据库运行循环独立推进，不需要等待新消息；其时间域为 processing time。触发审计表示“已发出”，不能据此推断请求已受理或计算已成功。
 
-## 使用 Coding Agent 快速接入
+## 使用 Coding Agent 编写计算逻辑
 
-Reviewer 可以把 [EventFlow 使用 skill](.skills/use-eventflow/SKILL.md) 交给自己的 Coding Agent，让它根据业务需求定义输入表、级联 MV、Trigger 和计算函数，并生成完整的消息生产、数据库消费和 SQL 验证流程。
+可以先让 Coding Agent 加载仓库 `.skills/` 目录里的 [use-eventflow](.skills/use-eventflow/SKILL.md) skill，再直接描述业务需求。例如：
 
-在 EventFlow 源码目录中，可以直接给 Coding Agent 下面这段提示词，再替换最后的业务需求：
-
-> 请先读取 `.skills/use-eventflow/SKILL.md` 和 `examples/streaming_database/README.md`，基于当前源码实现我的需求：接收包含 ticker、timestamp_us、headline、text_body、sentiment_score、market_price 的新闻流，按 ticker 维护新闻情绪特征，条件满足时触发影响指标计算，并每五秒重算当前特征。请提供静态计算定义、数据库持续消费消息的部署方式、SQL 断言、运行命令和验证结果。
-
-`.skills/` 是本仓库提供的 skill 目录，各 Coding Agent 的自动发现规则可能不同。显式要求读取上述文件即可使用；支持本地 skill 加载的工具也可以加载 `.skills/use-eventflow/`。其中的 `agents/openai.yaml` 是可选元数据，普通 Markdown 入口不依赖特定工具。
+> 请加载 `.skills/use-eventflow` 里的 skill，帮我做一个新闻影响指标。
+>
+> 新闻流包含股票代码、时间、标题、正文、情绪分数和当时股价。请按股票代码统计新闻数量和平均情绪。当新闻数量不少于两条、平均情绪不低于 0.5 时，计算一次影响分数；另外每隔 5 秒也计算一次。
+>
+> 影响分数取每条新闻“情绪分数乘以当时股价”的平均值。我希望能用 SQL 查询每只股票的最新结果。
 
 ## 文档与源码入口
 
@@ -454,7 +453,8 @@ Reviewer 可以把 [EventFlow 使用 skill](.skills/use-eventflow/SKILL.md) 交�
 
 | 阅读目的 | 入口 |
 | --- | --- |
-| 自定义计算、启动集群、生产消息并执行 SQL 断言 | [流式数据库示例](examples/streaming_database/README.md) |
+| 上传 UDF、提交计算定义、启动集群、SQL 验证与 checkpoint 恢复 | [流式数据库示例](examples/streaming_database/README.md) |
+| 将用户函数编译为 `.so`，直接传递 C++ 对象并通过执行器调用 | [C++ 动态函数示例](examples/cpp_udf/README.md)（本地执行器） |
 | 按主题查找文档 | [文档导航](docs/README.md) |
 | 理解流处理概念与成熟系统的设计 | [流式计算与数据库调研](docs/research.md) |
 | 沿 SQL、增量视图、触发和请求追踪实现 | [详细架构、接口语义与实现导读](docs/implementation_guide.md) |
@@ -467,7 +467,8 @@ Reviewer 可以把 [EventFlow 使用 skill](.skills/use-eventflow/SKILL.md) 交�
 | 关注点 | 源码位置 |
 | --- | --- |
 | 自定义业务定义、消息服务、数据库启动和 SQL 验证 | [examples/streaming_database/](examples/streaming_database/) |
-| 声明式 Trigger、Pattern、静态函数与绑定 | [trigger.hpp](include/eventflow/trigger.hpp)、[computation.hpp](include/eventflow/computation.hpp) |
+| 引擎内的 Trigger、Pattern 与计算定义绑定 | [trigger.hpp](include/eventflow/trigger.hpp)、[computation.hpp](include/eventflow/computation.hpp) |
+| 原生 UDF 接口、加载器与可提交计算定义 | [udf.hpp](include/eventflow/udf.hpp)、[submitted_computation.hpp](include/eventflow/submitted_computation.hpp) |
 | 消息源及数据库持续消费 | [message_source.hpp](include/eventflow/message_source.hpp)、[source_poller.hpp](include/eventflow/source_poller.hpp)、[src/ingest/](src/ingest/) |
 | Coordinator、Compute 和 KV 服务 | [src/service/](src/service/) |
 | C++ 集群客户端 | [cluster_client.hpp](include/eventflow/cluster_client.hpp)、[src/client/](src/client/) |
@@ -565,4 +566,4 @@ ctest --test-dir build --output-on-failure -j 2
 make release JOBS=4
 ```
 
-完整示例通过 [run.sh](examples/streaming_database/run.sh) 构建与运行；复用已有构建的方式见[示例说明](examples/streaming_database/README.md)。本地可用 `make compdb` 通过 Bear 记录实际编译；clangd 读取 CMake 自动更新的 `build/compile_commands.json`。
+默认示例通过 [streaming_database/run.sh](examples/streaming_database/run.sh) 构建并验证上传、部署与恢复；复用已有构建及安装目录运行方式见该示例 README。本地可用 `make compdb` 通过 Bear 记录实际编译；clangd 读取 CMake 自动更新的 `build/compile_commands.json`。

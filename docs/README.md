@@ -8,7 +8,7 @@ EventFlow 用表和级联物化视图维护持续到来的数据，用声明式 
 ./examples/streaming_database/run.sh
 ```
 
-完整示例包含独立 HTTP 消息服务、一个 KV、一个 Coordinator 和两个 Compute。用户先定义表、级联 MV、Trigger 和静态函数，再部署相同的计算模块；客户端向消息服务生产数据，数据库内的 SourcePoller 持续拉取并驱动计算，客户端通过 SQL 检查结果。追加输入后仍由数据库自动推进，无需客户端调用 ingest、pump 或 drain。
+完整示例包含独立 HTTP 消息服务、一个 KV、一个 Coordinator 和两个 Compute。服务启动后，用户通过 SDK 上传 `.so`，提交表、级联 MV 和触发规则，再调用 deploy；客户端向消息服务生产数据，数据库内的 SourcePoller 持续拉取并驱动计算，客户端通过 SQL 检查结果。追加输入后仍由数据库自动推进，无需客户端调用 ingest、pump 或 drain。
 
 ## 按阅读目的选择入口
 
@@ -25,12 +25,12 @@ EventFlow 用表和级联物化视图维护持续到来的数据，用声明式 
 
 ## 阅读示例时关注什么
 
-**计算定义**说明字段、特征依赖、触发条件和函数输入；**运行配置**说明节点、路由、预算与消息源地址。示例的 ComputationModule 随数据库可执行文件静态编译，Coordinator 与 Compute 使用同一模块。当前没有动态上传函数或热插拔计算插件的接口。
+**计算定义**说明字段、特征依赖、触发条件和函数输入；**运行配置**说明节点、路由、预算与消息源地址。示例通过 SDK 上传函数和提交计算规则，Compute 从共享 KV 读取 `.so` 并加载。目前只支持首次部署前提交，还不能修改运行中的计算图。
 
 **持续消费**由 Coordinator 托管的 SourcePoller 完成。HttpMessageSource 从独立 HTTP 服务读取消息，输入持久提交得到确认后才 ACK。HTTP 服务是本地消息设施替身；真实 Kafka broker 的集成与验证另有范围，不能从这个示例推导。
 
 **查询结果**与**触发发生**是不同的状态。MV 保存持续维护的关系结果，Trigger 创建请求并固定输入，后台函数完成后才有对应的成功结果；trigger_audit 可以查询触发历史，审计行本身不代表函数成功。查询不会替数据库推进计算。
 
-**恢复点**需要同时绑定源位置、Catalog 和运行时状态。单独的 KV snapshot 只是存储快照，不能等同于完整 checkpoint。
+**恢复时**需要恢复数据处理进度、计算定义、运行状态和 UDF 文件。示例会从 checkpoint 重启数据库，再输入新数据验证计算结果；客户端不需要再次上传 `.so`。
 
-开发约束、接口契约、当前任务、后续范围和独立审查位于 [specs/](../specs/INDEX.md)。历史构建与测试结果只覆盖对应快照；当前实现与示例的验证应查看本轮记录。动态 UDF、UDTF、UDAF、Process Function、在线图迁移和 HA 仍属于后续范围。
+开发约束、接口契约、当前任务、后续范围和独立审查位于 [specs/](../specs/INDEX.md)。历史构建与测试结果只覆盖对应快照；当前实现与示例的验证应查看本轮记录。已支持原生 C++ UDF 上传和首次部署；完整 UDTF/UDAF、Process Function、运行中改图和 HA 暂未实现。

@@ -7,6 +7,8 @@
 
 ## 职责与入口
 
+- `udf.cpp`：受控 C++ ABI、共享库字节加载、SHA-256 身份与库生命周期；`submitted_computation.cpp`：有限结构化定义/codec、当前字段 capture、session/Trigger/UDF 装配。范围与验证以 [生产 UDF 规格](../../specs/native-udf-delivery.md)为准。
+
 - `computation_runtime.cpp`：可注入 BoundComputation 的通用 shard 运行时，拥有 EventProcessor/执行器，保留 UNKNOWN 与尚未确认的 completion；不包含示例业务定义。
 - `engine.cpp` / `engine_internal.hpp`：唯一 shard owner、staging、增量关系、提交确认与查询缓存。
 - `event_processor.cpp`：源去重、TTL、候选、Clock、FSM/CEP、请求接入及生命周期恢复。

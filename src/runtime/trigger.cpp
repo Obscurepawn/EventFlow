@@ -322,6 +322,67 @@ Trigger Trigger::with_capture(TriggerCaptureBinder binder) const noexcept {
   return Trigger(std::move(data));
 }
 
+Trigger Trigger::capture_current(RelationId view, std::vector<std::string> fields,
+                                 std::vector<Field> expected) const noexcept {
+  return with_capture([view, fields = std::move(fields), expected = std::move(expected)](
+                          const CatalogSnapshot& catalog, const std::vector<PatternLabelInfo>&,
+                          const std::string&) noexcept -> StatusOr<BoundInputCapture> {
+    EF_ASSIGN_OR_RETURN(auto relation, catalog.find(view));
+    EF_RETURN_IF_ERROR(
+        check(relation->unique_per_partition && !fields.empty() && fields.size() <= 64,
+              "Current capture requires a unique view and one to 64 fields"));
+    if (!expected.empty() && expected.size() != fields.size())
+      return Status(ErrorCode::InvalidArgument, "Capture field count differs from function input");
+    std::vector<std::size_t> slots;
+    std::vector<Field> output;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+      EF_ASSIGN_OR_RETURN(auto slot, relation->storage_schema.index_of(fields[i]));
+      if (slot >= relation->visible_count)
+        return Status(ErrorCode::InvalidArgument, "Capture cannot read hidden fields");
+      auto field = relation->storage_schema.fields[slot];
+      if (!expected.empty()) {
+        if (expected[i].type != field.type)
+          return Status(ErrorCode::InvalidArgument,
+                        "Capture column type differs from function input");
+        field = expected[i];
+      }
+      slots.push_back(slot);
+      output.push_back(std::move(field));
+    }
+    return BoundInputCapture{
+        .source = CaptureSource::Current,
+        .fields = output,
+        .reads = {view},
+        .signature = Json{{"format", "named_current_capture.v1"},
+                          {"view", view},
+                          {"columns", fields},
+                          {"output", field_definitions(output)}}
+                         .dump(),
+        .match = {},
+        .current = [view, slots = std::move(slots),
+                    output](RoundContext& round,
+                            const Row& scope) noexcept -> StatusOr<std::optional<Row>> {
+          EF_ASSIGN_OR_RETURN(auto current, round.read_relation(view, scope));
+          if (!current)
+            return std::optional<Row>{};
+          Row result;
+          for (std::size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i] >= current->size())
+              return Status(ErrorCode::InvalidArgument, "Capture row is narrower than its schema");
+            const auto& value = (*current)[slots[i]];
+            if (std::holds_alternative<std::monostate>(value) && !output[i].nullable)
+              return std::optional<Row>{};
+            result.push_back(value);
+          }
+          return std::optional<Row>(std::move(result));
+        }};
+  });
+}
+
+Trigger Trigger::request(StaticFunctionDefinition function, TriggerRequest request) const noexcept {
+  return with_function(std::move(function), std::move(request));
+}
+
 Trigger Trigger::with_function(StaticFunctionDefinition function,
                                TriggerRequest request) const noexcept {
   auto data = std::make_shared<Data>(*data_);

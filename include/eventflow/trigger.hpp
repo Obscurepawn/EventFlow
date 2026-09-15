@@ -98,6 +98,11 @@ public:
   Trigger in_session(SessionRef session) const noexcept;
   Trigger request(TriggerRequest request) const noexcept;
 
+  // Runtime declarations resolve fields by name and validate against the function schema at bind.
+  Trigger capture_current(RelationId view, std::vector<std::string> fields,
+                          std::vector<Field> expected = {}) const noexcept;
+  Trigger request(StaticFunctionDefinition function, TriggerRequest request) const noexcept;
+
   template <auto Fn>
   auto capture_match(std::vector<std::string> labels,
                      std::string implementation_identity = {}) const noexcept;

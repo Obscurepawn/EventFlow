@@ -4,7 +4,7 @@
 
 ## Query it
 
-Use the actual ticker printed by [streaming_database](../../../examples/streaming_database/README.md), for example `TICKER_0`:
+Use the actual ticker printed by [static_streaming](../../../examples/static_streaming/README.md), for example `TICKER_0`:
 
 ```sql
 SELECT rule_id, event_kind, occurred_at_us, evaluated_at_us,
@@ -21,7 +21,7 @@ EF_ASSIGN_OR_RETURN(auto history, client->query(
     Row{std::string{"TICKER_0"}}));
 ```
 
-Run `bash examples/streaming_database/run.sh` for the complete database deployment. While it is RUNNING, query trigger history through Meta using the actual ticker and endpoint. The SQL above is an additional read-only inspection, not a claim that the verifier prints those rows. See [recipes](recipes.md) for setup; the example creates a normal checkpoint but does not validate process reconstruction.
+Run `bash examples/static_streaming/run.sh` for the complete database deployment. While it is RUNNING, query trigger history through Meta using the actual ticker and endpoint. The SQL above is an additional read-only inspection, not a claim that the verifier prints those rows. See [recipes](recipes.md) for setup; the example creates a normal checkpoint but does not validate process reconstruction.
 
 Queries require one complete scope, like other EventFlow queries; no all-shard SELECT, ORDER BY or SQL LIMIT is added. Scope columns are `scope_key_0`, `scope_key_1`, etc., in partition order and with the original types. The current cluster takes one String ticker; embedded owners can use supported composite keys. `bound.explain()["trigger_audit"]` reports source-to-audit column mapping, relation ID and retention settings.
 

@@ -19,6 +19,8 @@
 
 ## 契约
 
+- 生产原生函数入口为 `udf.hpp`；`submitted_computation.hpp` 提供可通过 SDK 提交的有限定义。最新授权见 [生产 UDF 规格](../../specs/native-udf-delivery.md)：服务启动后的首次部署，受信任 `.so` 使用受控 C++ ABI，Compute 原生线程池执行；不代表运行中图迁移或独立 Worker 已完成。
+
 - 项目函数和模板/lambda 遵循根目录 `noexcept`、命名与具名 aggregate 初始化规则。保持可失败操作返回 `Status`/`StatusOr<T>`，先检查状态再读取值；`StatusOr::value()` 不是业务错误恢复入口。
 - 保持接口自包含；公开头文件不能包含 `src/` 私有头、GoogleTest 或暴露第三方实现细节。第三方类型若已是公开契约，改动必须同步所有调用方，不能只改声明。
 - 外部依赖保留接口与 deterministic simple adapter。接口修改同时检查 Memory/Rocks/Remote、MemMock/HTTP/Kafka、Simple/ThreadPool 等适用实现和共享合同测试。

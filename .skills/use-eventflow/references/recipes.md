@@ -1,16 +1,26 @@
 # 完整数据库应用：新闻、级联 MV 与触发评分
 
-优先复用 [streaming_database](../../../examples/streaming_database/README.md)。它独立定义业务图，启动真实共享 Rocks KV、Coordinator 和两个 Compute，另有独立 HTTP 消息服务。producer 只发布消息，数据库自动消费，客户端用 SQL 验证。
+默认完整示例是 [streaming_database](../../../examples/streaming_database/README.md)：先启动通用 Server，再用 SDK 上传 `.so`、提交计算规则并部署；恢复时从 KV 读取函数文件，不需要重新上传。业务定义和真实调用分别见 [definition.cpp](../../../examples/streaming_database/definition.cpp) 和 [verify.cpp](../../../examples/streaming_database/verify.cpp)。
 
 ```sh
 bash examples/streaming_database/run.sh
+```
+
+## 静态模块参考
+
+以下保留按 ComputationModule 编写应用的参考，只在需要这套 API 时使用。
+
+参考 [static_streaming](../../../examples/static_streaming/README.md)。它独立定义业务图，启动真实共享 Rocks KV、Coordinator 和两个 Compute，另有独立 HTTP 消息服务。producer 只发布消息，数据库自动消费，客户端用 SQL 验证。
+
+```sh
+bash examples/static_streaming/run.sh
 ```
 
 脚本支持首个构建目录参数、`EVENTFLOW_BUILD_DIR` 和已有二进制的 `EVENTFLOW_SKIP_BUILD=1`。新构建目录使用 Clang、Debug 和 Unix Makefiles。完整源码需要 `cpp3rdlib/`；二进制运行包仅能运行已有程序。执行后的实际输出才是通过证据，本文数值是代码中的预期断言。
 
 ## 从业务定义开始
 
-[definition.cpp](../../../examples/streaming_database/definition.cpp)包含完整 Catalog、SchemaTraits、capture、Function、session 与 Trigger 绑定；[definition.hpp](../../../examples/streaming_database/definition.hpp)只暴露模块工厂。
+[definition.cpp](../../../examples/static_streaming/definition.cpp)包含完整 Catalog、SchemaTraits、capture、Function、session 与 Trigger 绑定；[definition.hpp](../../../examples/static_streaming/definition.hpp)只暴露模块工厂。
 
 ```sql
 CREATE TABLE news_updates (
@@ -73,13 +83,13 @@ ComputationModule computation_module() noexcept {
 }
 ```
 
-[main.cpp](../../../examples/streaming_database/main.cpp)调用 `database_main`。Coordinator 与 Compute 使用相同模块，通用 [ComputationRuntime](../../../src/runtime/computation_runtime.cpp)管理 EventProcessor 和执行器。客户端的 `deploy()` 安装这一已编译定义，不上传函数或临时改写 Trigger。
+[main.cpp](../../../examples/static_streaming/main.cpp)调用 `database_main`。Coordinator 与 Compute 使用相同模块，通用 [ComputationRuntime](../../../src/runtime/computation_runtime.cpp)管理 EventProcessor 和执行器。客户端的 `deploy()` 安装这一已编译定义，不上传函数或临时改写 Trigger。
 
-完整 source 配置、二进制和进程启动顺序在 [run.sh](../../../examples/streaming_database/run.sh)。服务配置的 `source.type=http` 接入 HttpMessageSource；其 poll/position/ack 边界与 Kafka/MemMock 复用 IMessageSource，HTTP 服务仍只是本地消息设施。
+完整 source 配置、二进制和进程启动顺序在 [run.sh](../../../examples/static_streaming/run.sh)。服务配置的 `source.type=http` 接入 HttpMessageSource；其 poll/position/ack 边界与 Kafka/MemMock 复用 IMessageSource，HTTP 服务仍只是本地消息设施。
 
 ## 生产、部署、SQL 与精确断言
 
-[verify.cpp](../../../examples/streaming_database/verify.cpp)查找两个分别落在 shard 0、1 的 ticker。它没有数据库 ingest、pump、drain 调用；等待循环只读 SQL 或源确认位置。
+[verify.cpp](../../../examples/static_streaming/verify.cpp)查找两个分别落在 shard 0、1 的 ticker。它没有数据库 ingest、pump、drain 调用；等待循环只读 SQL 或源确认位置。
 
 | 阶段 | 预期行为 |
 | --- | --- |

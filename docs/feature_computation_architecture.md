@@ -1,5 +1,7 @@
 # EventFlow Feature Database：产品形态与顶层设计
 
+当前默认完整用法是 [SDK 上传 UDF 的流式示例](../examples/streaming_database/README.md)；本文中保留的静态模块代码参考已移到 [static_streaming](../examples/static_streaming/README.md)。原生上传与分发的最新范围见 [生产 UDF 规格](../specs/native-udf-delivery.md)。
+
 EventFlow 面向持续到来的新闻与行情：先更新累计量、报价和窗口等状态，在条件成立或定时器到点时发起特征计算，再保存可查询的结果。本文解释这些步骤如何通过视图依赖和触发规则连接，以及计算、存储和恢复各自负责什么。
 
 建议按“业务案例 → 视图与触发 → 进程职责 → 存储与输入一致性”的顺序阅读。运行命令见[运行手册](core_delivery.md)，沿当前源码追踪实现可读[实现导读](implementation_guide.md)。本文也保留产品建议与历史设计；标注为拟议或后续的内容需要按其所在段落的边界理解。
@@ -938,7 +940,7 @@ Compute的状态缓存按已确认revision和owner epoch维护，有界存放正
 
 当前核心由同一个可执行文件的三个子命令组成：`eventflow coordinator`、`eventflow compute`和`eventflow kv`。Coordinator 管理静态路由、启动前 DDL、checkpoint 和 SourcePoller；每个Compute按业务key推进关系与触发状态，并把已捕获输入交给函数线程池。共享KV保存基表、物化视图和恢复状态。
 
-[可运行示例](../examples/streaming_database/README.md)展示 SQL 级联 MV、条件和 Clock 触发、数据库主动消费、暂停与恢复消费，以及创建一致 checkpoint。示例模型是确定性计算，用于验证依赖、输入冻结和结果复用；其数值不代表预测效果。
+[可运行示例](../examples/static_streaming/README.md)展示 SQL 级联 MV、条件和 Clock 触发、数据库主动消费、暂停与恢复消费，以及创建一致 checkpoint。示例模型是确定性计算，用于验证依赖、输入冻结和结果复用；其数值不代表预测效果。
 
 Rocks 全进程恢复的独立验证由[核心进程测试](../tests/core_cluster_test.cpp)覆盖，使用固定输入身份的 SDK 投递；这项证据不代表新 HTTP 消息源的全进程恢复已经验证。
 
@@ -952,7 +954,7 @@ Rocks 全进程恢复的独立验证由[核心进程测试](../tests/core_cluste
 
 ### 交付状态记录（2026-09-14，原文保留）
 
-以下旧示例目录已退出当前交付；相应业务回归保留在 [tests/support](../tests/support/)，当前使用流程见[主动消费示例](../examples/streaming_database/README.md)。
+以下旧示例目录已退出当前交付；相应业务回归保留在 [tests/support](../tests/support/)，当前使用流程见[主动消费示例](../examples/static_streaming/README.md)。
 
 当前可运行版本提供：真实1 KV + 1 Coordinator/Meta + 多Compute、Meta bootstrap SDK、启动前DDL、统一Catalog与级联MV、条件/Clock、请求固定输入、Latest及Rocks整集群checkpoint恢复已接通。Meta持久保存核心Schema、内置计算定义、运行配置、路由、交付前缀和水位；静态单部署不等于完整在线Job/Schema生命周期。
 

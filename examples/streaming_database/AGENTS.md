@@ -1,10 +1,10 @@
-# 数据库主动消费示例
+# SDK 上传 UDF 的流式数据库示例
 
-继承 [examples 约定](../AGENTS.md)，先读 [README](README.md) 和[当前规格](../../specs/streaming-database-example.md)。
+继承根目录与 examples 约定。当前调整见 specs/streaming-udf-default.md，生产接口见 specs/native-udf-delivery.md。
 
-- `definition.cpp` 独立定义六字段新闻表、news_stats/news_features 两级 MV、显式 news_session、情绪阈值 once Trigger 和 200 ms Clock；当前业务合同见 [news-streaming-example.md](../../specs/news-streaming-example.md)。
-- `main.cpp` 将应用静态模块交给通用数据库入口；`message_server.cpp` 是独立消息进程。
-- `verify.cpp` 只生产 HTTP 消息、控制部署和查询 SQL。数据库消费、ACK、时钟和函数执行由服务托管。
-- 保留两个不同 shard 的 key；同步 README 的新闻时间线、51.5/128/53 影响指标与固定输入断言，六个原始字段须经 SQL 原样读回。
-- 正常验收包含部署前未 ACK、自动消费、无新消息的周期触发、暂停恢复、完整 checkpoint；不增加故障注入。
-- `run.sh` 构建三个本例目标并检查所有进程退出码；日志和 RocksDB 数据保留在打印的临时目录。
+- definition.cpp 返回 SubmittedComputation，业务函数由 ../cpp_udf/news_impact.cpp 单独编译为 .so。
+- 使用通用 eventflow Server，启动后 SDK 上传、提交、deploy；服务端不静态链接新闻业务。
+- verify.cpp 只生产 HTTP 消息、控制部署、查询；不调用 ingest/pump/drain 代替数据库计算。
+- run.sh 启动消息服务、共享 Rocks KV、Coordinator 与两个 Compute，再从 checkpoint 重启数据库进程；恢复不重新上传 UDF。
+- 保留 51.5/128/53、恢复后 54.75 和旧固定结果 51.5；消息服务在恢复期间保持存活。
+- 静态模块完整示例保留在 ../static_streaming，../native_udf 只是兼容转发入口。

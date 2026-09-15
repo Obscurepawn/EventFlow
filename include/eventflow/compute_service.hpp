@@ -16,6 +16,7 @@ struct ComputeServiceConfig {
   std::size_t max_functions_per_call = 4096;
   std::size_t worker_threads = 4;
   std::size_t max_queued_requests = 64;
+  bool allow_native_udfs = false;
 };
 
 // One immutable shard assignment per process. HTTP operations serialize each

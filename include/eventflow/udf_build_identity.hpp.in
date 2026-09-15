@@ -1,0 +1,27 @@
+#pragma once
+
+#include <string>
+
+#define EF_UDF_STRING_IMPL(value) #value
+#define EF_UDF_STRING(value) EF_UDF_STRING_IMPL(value)
+
+namespace eventflow::udf_detail {
+
+inline constexpr char build_id[] = "@EVENTFLOW_CPP_UDF_BUILD_ID@;"
+#if defined(_LIBCPP_VERSION)
+                                   "libc++=" EF_UDF_STRING(_LIBCPP_VERSION)
+#elif defined(__GLIBCXX__)
+                                   "libstdc++=" EF_UDF_STRING(__GLIBCXX__) ";abi=" EF_UDF_STRING(
+                                       _GLIBCXX_USE_CXX11_ABI)
+#else
+                                   "unknown-stdlib"
+#endif
+#if defined(_GLIBCXX_DEBUG)
+                                       ";debug-iterators"
+#endif
+    ;
+
+} // namespace eventflow::udf_detail
+
+#undef EF_UDF_STRING
+#undef EF_UDF_STRING_IMPL

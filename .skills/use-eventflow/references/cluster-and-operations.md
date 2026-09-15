@@ -1,6 +1,6 @@
 # Cluster, input and operating APIs
 
-Use this reference for a static database module, remote client, database-managed source consumption, checkpoint or consumer build. The complete application is [streaming_database](../../../examples/streaming_database/README.md). For custom C++ computation definitions read [Trigger APIs](trigger-api.md); for full examples read [recipes](recipes.md).
+Use this reference for a static database module, remote client, database-managed source consumption, checkpoint or consumer build. The complete application is [static_streaming](../../../examples/static_streaming/README.md). For custom C++ computation definitions read [Trigger APIs](trigger-api.md); for full examples read [recipes](recipes.md).
 
 Contents: SDK methods; wire protocol; source delivery; time; storage/checkpoints; build and diagnostics.
 
@@ -127,7 +127,7 @@ Reliable source replay can replace an application redo log only with a verified 
 
 ## Build an application against the source checkout
 
-The complete starting point is `bash examples/streaming_database/run.sh`, with application-owned `definition.cpp`, database `main.cpp`, independent message server and verifier. To keep a consumer outside the repository, the following complete `CMakeLists.txt` links the same public targets; provide your own `main.cpp` and set `EVENTFLOW_ROOT` at configure time. It requires the full source checkout and its `cpp3rdlib` bundle.
+The complete starting point is `bash examples/static_streaming/run.sh`, with application-owned `definition.cpp`, database `main.cpp`, independent message server and verifier. To keep a consumer outside the repository, the following complete `CMakeLists.txt` links the same public targets; provide your own `main.cpp` and set `EVENTFLOW_ROOT` at configure time. It requires the full source checkout and its `cpp3rdlib` bundle.
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)

@@ -6,6 +6,8 @@ Updated: 2026-09-14
 
 ## 1. 已实现核心与完整产品合同
 
+后续授权补充：2026-09-16 用户选择实施 [生产 C++ UDF 上传与首次部署](native-udf-delivery.md)，增加服务启动后 STAGING 上传、结构化定义提交与首次部署。该记录是此有限切片的最新状态；下文在线迁移、多 Job 与完整扩展族合同继续后置。
+
 MetaService 是 Schema、配置和必要元数据的唯一权威，Compute 只安装、执行和缓存明确版本。部署保持 1 Coordinator、1 KV、N Compute，共 N+2 个进程；共享 KV、同 key 单 owner、无 MVCC/HA/跨 key 计算不变。依据[产品范围](product-scope.md)、[运行时契约](runtime-contracts.md)和[架构](../docs/feature_computation_architecture.md)。
 
 | 当前实现 | 真实边界 |

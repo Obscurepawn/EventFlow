@@ -10,6 +10,8 @@
 
 ## 必须保持的契约
 
+- `register_udf` 上传客户端 `.so` 并核对响应内容摘要；`submit_computation` 提交结构化定义，`deploy` 安装已提交定义。前两者是首次部署前控制操作，无自动重试；UDF 请求有独立字节预算，不绕过普通请求上限。参见 [生产 UDF 规格](../../specs/native-udf-delivery.md)。
+
 - 64 位 version/revision/offset/time 在 Compute/Meta 元数据中使用规范十进制字符串，拒绝舍入后的 JSON number；shard/partition/count 按整数校验。
 - 业务 Row 使用 Value codec，查询结果按返回字段验证类型和宽度，保留 Int64 精度；不要把元数据字符串规则强加到所有业务数值。
 - 输入是否可确认取决于 `ClusterIngestResult::input_committed`；`operation_status` 可能报告提交后失败，不能因其失败抹去已提交事实，也不能因 HTTP 200 直接 ACK。

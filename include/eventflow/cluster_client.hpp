@@ -1,5 +1,6 @@
 #pragma once
 #include "eventflow/source_identity.hpp"
+#include "eventflow/submitted_computation.hpp"
 #include "eventflow/types.hpp"
 #include <memory>
 #include <optional>
@@ -11,6 +12,7 @@ struct ClusterClientConfig {
   std::size_t max_response_bytes = 16 * 1024 * 1024;
   // Only ingest may retry transient transport/server failures; every attempt uses identical bytes.
   std::size_t ingest_attempts = 1;
+  std::size_t max_udf_request_bytes = 2 * max_udf_bytes + 65536;
 };
 
 struct ClusterIngestResult {
@@ -44,6 +46,8 @@ public:
   StatusOr<Json> catalog() noexcept;
   StatusOr<Json> ddl(std::string_view sql) noexcept;
   StatusOr<Json> deploy() noexcept;
+  StatusOr<FunctionRef> register_udf(const std::string& library_path) noexcept;
+  StatusOr<Json> submit_computation(const SubmittedComputation& definition) noexcept;
   StatusOr<ClusterIngestResult> ingest(std::string_view relation, const Row& row,
                                        const SourceIdentity& source, std::int64_t now_us,
                                        std::optional<std::int64_t> event_time_us = {}) noexcept;

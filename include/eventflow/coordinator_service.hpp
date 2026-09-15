@@ -31,6 +31,7 @@ struct CoordinatorServiceConfig {
   std::size_t max_request_bytes = 1024 * 1024;
   std::size_t max_response_bytes = 4 * 1024 * 1024;
   std::optional<SourceSubscription> source;
+  bool allow_native_udfs = false;
 };
 
 class CoordinatorService {

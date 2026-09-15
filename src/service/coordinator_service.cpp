@@ -3,6 +3,7 @@
 #include "eventflow/computation_runtime.hpp"
 #include "eventflow/key_codec.hpp"
 #include "eventflow/kv_protocol.hpp"
+#include "eventflow/submitted_computation.hpp"
 #include "eventflow/time.hpp"
 #include <atomic>
 #include <charconv>
@@ -129,6 +130,7 @@ struct CoordinatorService::Impl {
   std::uint64_t revision = 0;
   Json state;
   CatalogSnapshot catalog;
+  Json computation_explanation = Json::object();
   std::optional<CommitBatch> pending_batch;
   Json pending_state;
   bool failed = false;
@@ -290,7 +292,7 @@ struct CoordinatorService::Impl {
     return {};
   }
 
-  Status save(Json next) noexcept {
+  Status save(Json next, std::vector<Mutation> artifacts = {}) noexcept {
     EF_RETURN_IF_ERROR(resolve());
     EF_ASSIGN_OR_RETURN(auto id, make_commit_id(config.owner, config.shard_count, revision));
     CommitBatch batch{.shard = config.shard_count,
@@ -298,11 +300,16 @@ struct CoordinatorService::Impl {
                       .expected_revision = revision,
                       .commit_id = std::move(id),
                       .mutations = {{.key = key, .value = next.dump()}}};
+    for (auto& artifact : artifacts)
+      batch.mutations.push_back(std::move(artifact));
     EF_ASSIGN_OR_RETURN(auto limits, store->limits());
     EF_ASSIGN_OR_RETURN(auto bytes, canonical_batch(batch));
-    if (bytes.size() > limits.max_batch_bytes ||
+    if (batch.mutations.size() > limits.max_mutations || bytes.size() > limits.max_batch_bytes ||
         key.size() + batch.mutations[0].value->size() > limits.max_read_bytes)
       return Status(ErrorCode::ResourceExhausted, "Meta state exceeds actual KV capacity");
+    for (const auto& mutation : batch.mutations)
+      if (mutation.value && mutation.key.size() + mutation.value->size() > limits.max_read_bytes)
+        return Status(ErrorCode::ResourceExhausted, "UDF artifact exceeds KV read capacity");
 
     pending_batch = std::move(batch);
     pending_state = std::move(next);
@@ -322,12 +329,26 @@ struct CoordinatorService::Impl {
       ddl.push_back(sql.get<std::string>());
     }
 
-    EF_ASSIGN_OR_RETURN(auto definition, bind_computation_module(module, ddl));
+    const auto submitted = state.value("submitted", Json{});
+    if (!submitted.is_null() && (!config.allow_native_udfs || module.bind || module.name != "sql"))
+      return blocked("this server cannot load submitted native computations");
+    if (!submitted.is_null()) {
+      EF_ASSIGN_OR_RETURN(auto decoded, decode_computation(submitted));
+      if (decoded.ddl != ddl)
+        return Status(ErrorCode::Conflict, "stored DDL differs from submitted computation");
+    }
+    EF_ASSIGN_OR_RETURN(auto definition,
+                        submitted.is_null()
+                            ? bind_computation_module(module, ddl)
+                            : load_submitted_computation(*store, config.shard_count, submitted,
+                                                         state.value("udfs", Json::array()),
+                                                         {.shard_count = config.shard_count}));
     if (state.contains("catalog_fingerprint") &&
         state["catalog_fingerprint"] != definition.catalog.fingerprint)
       return Status(ErrorCode::Conflict, "stored Catalog differs from this recipe implementation");
 
     catalog = std::move(definition.catalog);
+    computation_explanation = std::move(definition.explanation);
     return {};
   }
 
@@ -492,6 +513,8 @@ struct CoordinatorService::Impl {
                                            {"recipe_version", std::to_string(module.version)},
                                            {"catalog_fingerprint", catalog.fingerprint},
                                            {"ddl", state["ddl"]},
+                                           {"submitted", state.value("submitted", Json{})},
+                                           {"udfs", state.value("udfs", Json::array())},
                                            {"shard_count", config.shard_count}}));
     EF_RETURN_IF_ERROR(verify_reports(reports, false));
     next = state;
@@ -808,6 +831,10 @@ struct CoordinatorService::Impl {
 
     if (action == "ddl")
       EF_RETURN_IF_ERROR(fields(body, {"sql"}));
+    else if (action == "register_udf")
+      EF_RETURN_IF_ERROR(fields(body, {"bytes"}));
+    else if (action == "submit_computation")
+      EF_RETURN_IF_ERROR(fields(body, {"definition"}));
     else if (action == "ingest")
       EF_RETURN_IF_ERROR(fields(body, {"relation", "row", "source", "now_us"}, {"event_time_us"}));
     else if (action == "pump")
@@ -845,6 +872,9 @@ struct CoordinatorService::Impl {
     if (action == "catalog") {
       EF_ASSIGN_OR_RETURN(auto wire, encode_catalog(catalog));
       return Json{{"catalog", std::move(wire)},
+                  {"submitted", state.value("submitted", Json{})},
+                  {"udfs", state.value("udfs", Json::array())},
+                  {"explanation", computation_explanation},
                   {"ddl", state["ddl"]},
                   {"deployment_version", version()},
                   {"recipe", module.name},
@@ -852,8 +882,70 @@ struct CoordinatorService::Impl {
                   {"config", state["config"]}};
     }
 
+    if (action == "register_udf") {
+      if (!config.allow_native_udfs || phase() != "STAGING" || !config.restore_checkpoint.empty())
+        return blocked("native UDF upload requires an enabled server before initial deployment");
+      if (!body["bytes"].is_string() ||
+          body["bytes"].get_ref<const std::string&>().size() > 2 * max_udf_bytes)
+        return invalid("UDF upload exceeds byte limit");
+      EF_ASSIGN_OR_RETURN(auto bytes, hex_decode(body["bytes"].get_ref<const std::string&>()));
+      EF_ASSIGN_OR_RETURN(auto library, UdfLibrary::open(bytes));
+      const auto& signature = library->definition().signature;
+      auto ref = encode_function_ref(
+          {.id = signature.function_id, .version = signature.version, .digest = library->digest()});
+      EF_ASSIGN_OR_RETURN(auto validated, decode_function_ref(ref));
+      (void)validated;
+      Json next = state;
+      auto registered = next.value("udfs", Json::array());
+      if (!registered.is_array())
+        return invalid("invalid saved UDF registry");
+      for (const auto& previous : registered) {
+        EF_ASSIGN_OR_RETURN(auto previous_ref, decode_function_ref(previous));
+        (void)previous_ref;
+        if (previous["id"] == ref["id"] && previous["version"] == ref["version"]) {
+          if (previous != ref)
+            return Status(ErrorCode::Conflict, "registered function version has different bytes");
+          return ref;
+        }
+      }
+      if (registered.size() >= 16)
+        return Status(ErrorCode::ResourceExhausted, "registered UDF limit reached");
+      registered.push_back(ref);
+      next["udfs"] = std::move(registered);
+      EF_ASSIGN_OR_RETURN(auto artifact_key,
+                          udf_storage_key(config.shard_count, library->digest()));
+      EF_RETURN_IF_ERROR(
+          save(std::move(next), {{.key = std::move(artifact_key), .value = std::move(bytes)}}));
+      return ref;
+    }
+
+    if (action == "submit_computation") {
+      if (!config.allow_native_udfs || phase() != "STAGING" || !config.restore_checkpoint.empty() ||
+          module.bind || module.name != "sql")
+        return blocked(
+            "submitted computation requires an enabled default server before deployment");
+      EF_ASSIGN_OR_RETURN(auto submitted, decode_computation(body["definition"]));
+      EF_ASSIGN_OR_RETURN(auto canonical, encode_computation(submitted));
+      EF_ASSIGN_OR_RETURN(auto definition,
+                          load_submitted_computation(*store, config.shard_count, canonical,
+                                                     state.value("udfs", Json::array()),
+                                                     {.shard_count = config.shard_count}));
+      Json next = state;
+      next["submitted"] = std::move(canonical);
+      next["ddl"] = submitted.ddl;
+      next["catalog_fingerprint"] = definition.catalog.fingerprint;
+      if (next != state)
+        EF_RETURN_IF_ERROR(save(std::move(next)));
+      catalog = std::move(definition.catalog);
+      computation_explanation = std::move(definition.explanation);
+      return Json{{"state", "STAGED"},
+                  {"explanation", computation_explanation},
+                  {"catalog_fingerprint", catalog.fingerprint}};
+    }
+
     if (action == "ddl") {
-      if (phase() != "STAGING" || !config.restore_checkpoint.empty())
+      if (phase() != "STAGING" || !config.restore_checkpoint.empty() ||
+          !state.value("submitted", Json{}).is_null())
         return blocked("core DDL is staged before deployment; online migration is not implemented");
 
       EF_ASSIGN_OR_RETURN(auto sql, kv_protocol::text(body, "sql"));

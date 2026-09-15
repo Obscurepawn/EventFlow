@@ -31,7 +31,7 @@ ctest --test-dir build --output-on-failure -R '^(core_cluster_test|remote_store_
 - 多进程测试使用 `core_process_harness.hpp`/`kv_process.hpp`，保留动态端口、READY 超时、日志、子进程退出状态及失败路径清理；不要以同进程对象替代端到端部署。
 - 消息源快速测试使用 MemMock；`message_source_test` 的 Kafka 适配器合同使用 librdkafka protocol mock，不依赖外部 broker，也不证明真实 Kafka Compose 集成。后者仍为后置范围。
 - 断言可观察的不变量：UNKNOWN 确认原批后再 ACK、无半批状态、epoch/owner 失效、预算边界、deadline 排除边界、固定捕获输入、恢复身份及连续源位置；不要只断言调用次数或成功状态。
-- 新的强类型静态 `Function` 已有实现与测试；动态 UDF/UDTF/UDAF、Process Function 不作为本轮测试完成门槛。
+- 强类型静态 `Function` 已有实现与测试。[生产 UDF 规格](../specs/native-udf-delivery.md)新增原生 `.so` 加载、SDK 上传、首次部署及恢复制品的验收，以 udf_test、submitted_computation_test、Coordinator UNKNOWN 用例和 streaming_database_example 验证。完整 UDTF/UDAF、Process Function 与运行中图迁移仍后置。
 - 记录实际运行命令、退出结果、源码状态及未覆盖边界；不要引用旧测试总数代替当前验证。全局审查和规格证据要求继承根目录约束。
 
 旧业务回归只保留在 `tests/support/legacy_feature_fixture.*`，相关服务测试显式注入测试模块；生产服务和新示例不得链接这个 fixture。本轮不新增专门故障注入测试。

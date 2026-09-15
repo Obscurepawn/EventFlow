@@ -1,6 +1,8 @@
 # EventFlow 实现导读：从 SQL、状态与触发到异步特征结果
 
-以[新闻影响指标示例](../examples/streaming_database/README.md)为主线：生产者将六字段新闻写入独立消息服务，EventFlow 主动消费，更新新闻统计和级联特征；条件或 Clock 触发请求后，系统固定本次计算需要的输入，由后台函数计算并发布结果。后来的新闻不会改写旧请求的输入。本文也用局部新闻 Pattern 和多目标 DAG 片段解释通用机制；它们不是示例中额外安装的业务图。
+当前默认完整用法是 [SDK 上传 UDF 的流式示例](../examples/streaming_database/README.md)；本文中保留的静态模块代码参考已移到 [static_streaming](../examples/static_streaming/README.md)。原生上传与分发的最新范围见 [生产 UDF 规格](../specs/native-udf-delivery.md)。
+
+以[新闻影响指标示例](../examples/static_streaming/README.md)为主线：生产者将六字段新闻写入独立消息服务，EventFlow 主动消费，更新新闻统计和级联特征；条件或 Clock 触发请求后，系统固定本次计算需要的输入，由后台函数计算并发布结果。后来的新闻不会改写旧请求的输入。本文也用局部新闻 Pattern 和多目标 DAG 片段解释通用机制；它们不是示例中额外安装的业务图。
 
 Catalog 记录表、视图和函数之间的依赖；物化视图（MV）保存随输入更新的查询结果。Trigger 声明触发条件，Pattern 声明多条事件的匹配顺序，Latest 保存当前选中的成功请求结果。多个 Compute 进程处理不同业务分片，状态共同存放在独立的键值存储服务（KV Service）中。每个分片只由一个执行者（owner）推进状态，并由它原子发布相应结果与 Latest。
 
@@ -68,7 +70,7 @@ KV listens
 
 ### 独立定义与服务装配
 
-[definition.cpp](../examples/streaming_database/definition.cpp)先定义 `news_updates -> news_stats -> news_features`，然后定义 session、阈值 Trigger 和周期 Trigger。`capture_current` 将新闻条数、平均情绪和情绪价格乘积合计固定给影响指标函数，最后调用 `TriggerSet::bind`。示例工厂接收 `staged_ddl`，在绑定 Trigger 前应用它们；工厂失败时不发布部分定义。
+[definition.cpp](../examples/static_streaming/definition.cpp)先定义 `news_updates -> news_stats -> news_features`，然后定义 session、阈值 Trigger 和周期 Trigger。`capture_current` 将新闻条数、平均情绪和情绪价格乘积合计固定给影响指标函数，最后调用 `TriggerSet::bind`。示例工厂接收 `staged_ddl`，在绑定 Trigger 前应用它们；工厂失败时不发布部分定义。
 
 ```cpp
 ComputationModule computation_module() noexcept {
@@ -76,7 +78,7 @@ ComputationModule computation_module() noexcept {
 }
 ```
 
-`bind_definition` 的完整签名与实现见示例源码；它返回 `StatusOr<BoundComputation>`。入口 [main.cpp](../examples/streaming_database/main.cpp)调用 `database_main(argc, argv, computation_module())`。服务通用实现通过同一模块生成 Catalog、规则与 Registry，并校验持久定义身份和部署 fingerprint。模块随程序编译，SDK 不传函数地址或上传闭包。
+`bind_definition` 的完整签名与实现见示例源码；它返回 `StatusOr<BoundComputation>`。入口 [main.cpp](../examples/static_streaming/main.cpp)调用 `database_main(argc, argv, computation_module())`。服务通用实现通过同一模块生成 Catalog、规则与 Registry，并校验持久定义身份和部署 fingerprint。模块随程序编译，SDK 不传函数地址或上传闭包。
 
 [ComputationRuntime](../src/runtime/computation_runtime.cpp)接管原先由业务示例维护的通用 owner/executor 循环：源行进入 EventProcessor，确认的任务交给执行器，completion 回到 owner 完成原子发布。Compute 为每个 shard 创建运行时；worker 不拥有 Engine 或 KV 写权限。服务库无需链接示例业务定义；旧业务 fixture 只保留作回归支持。
 
@@ -90,7 +92,7 @@ C++ 编译检查静态函数输入输出与 `noexcept`；bind 检查实际 Schem
 
 ### 客户端只生产、部署并查询
 
-完整流程见 [verify.cpp](../examples/streaming_database/verify.cpp)：先 publish 新闻到独立消息服务，确认 STAGING 未消费，再 `deploy()`；数据库自行消费并更新结果。验证器的等待循环仅查询 SQL/消息确认位置，不调用数据库 ingest/pump/drain。
+完整流程见 [verify.cpp](../examples/static_streaming/verify.cpp)：先 publish 新闻到独立消息服务，确认 STAGING 未消费，再 `deploy()`；数据库自行消费并更新结果。验证器的等待循环仅查询 SQL/消息确认位置，不调用数据库 ingest/pump/drain。
 
 ```cpp
 Status query_news_features() noexcept {
@@ -260,7 +262,7 @@ lookup join 收集两边变化涉及的业务 scope，对同一个 scope 分别�
 
 ### 字段表达式读取本轮稳定 MV
 
-下面假设 `news` 是包含 `sentiment_score` 列的新闻表 ID；`ready` 是按业务 key 唯一定位的物化视图 ID，视图中有 Bool 类型的 `ready` 列。`event` 表示当前新闻事件，`ready_now` 读取当前视图中的条件值。这是说明表达式的局部片段；当前完整建表、绑定和运行入口见[新闻示例](../examples/streaming_database/definition.cpp)。
+下面假设 `news` 是包含 `sentiment_score` 列的新闻表 ID；`ready` 是按业务 key 唯一定位的物化视图 ID，视图中有 Bool 类型的 `ready` 列。`event` 表示当前新闻事件，`ready_now` 读取当前视图中的条件值。这是说明表达式的局部片段；当前完整建表、绑定和运行入口见[新闻示例](../examples/static_streaming/definition.cpp)。
 
 ```cpp
 const auto event = EventRef::source({.kind = "news", .payload_relation = news});
@@ -278,7 +280,7 @@ const auto rule = Trigger::on_event("ready_positive_news", event)
 
 基表写入与事件 payload 是独立字段：`ProcessorEvent.changes` 不自动证明 `values` 正确。调用方可用 `encode_typed(news)` 编码，但仍需显式填入 `source`、`scope`、`kind`、`values` 与 TableChange。原始行不会因为声明了 `payload_relation` 就被直接强转成业务 struct。
 
-当前新闻示例在 [definition.cpp](../examples/streaming_database/definition.cpp)中直接声明读取自己定义的级联 MV：
+当前新闻示例在 [definition.cpp](../examples/static_streaming/definition.cpp)中直接声明读取自己定义的级联 MV：
 
 ```text
 news_updates -> news_stats -> news_features(news_count, average_sentiment, sentiment_price_sum)
@@ -369,7 +371,7 @@ const auto session = SessionRef::candidate(candidate);
 
 一次公开操作固定一个 now，不在不同回调里重读墙钟。[TimerQueue](../src/runtime/time.cpp)处理到期顺序、generation、周期和 skipped slots。到期先于同刻新输入；延迟 guard 读取执行时的稳定状态，原 scheduled time 只是审计事实。相对 Timer 从实际执行 now 起算，不伪造过去的 MV 快照。
 
-当前[完整示例](../examples/streaming_database/README.md)使用 Coordinator 的 `tick_interval_ms=20` 自动推进已安装的 Clock，同时配置 `source.poll_interval_ms=10` 主动读取新闻。客户端无需调用 drain。没有 source 输入仍能处理 TTL/候选过期。周期按已经观察到的 scope 激活，不补激活前历史，错过时隙合并并记录 skipped。builder 自身没有定时线程。
+当前[完整示例](../examples/static_streaming/README.md)使用 Coordinator 的 `tick_interval_ms=20` 自动推进已安装的 Clock，同时配置 `source.poll_interval_ms=10` 主动读取新闻。客户端无需调用 drain。没有 source 输入仍能处理 TTL/候选过期。周期按已经观察到的 scope 激活，不补激活前历史，错过时隙合并并记录 skipped。builder 自身没有定时线程。
 
 ### 内置触发审计表
 
@@ -542,10 +544,10 @@ LatestView 显式依赖结果关系、RequestStatus 和 Candidate 三者。候�
 
 ## 10. 一条完整轨迹：新闻触发一次固定影响指标计算
 
-[新闻示例](../examples/streaming_database/README.md)是这条轨迹的完整入口：
+[新闻示例](../examples/static_streaming/README.md)是这条轨迹的完整入口：
 
 ```sh
-bash examples/streaming_database/run.sh
+bash examples/static_streaming/run.sh
 ```
 
 以其中一个 ticker 为例，先向消息服务写入两条新闻，情绪/价格分别为 0.25/100 和 0.75/104。部署前消息不被确认；部署后数据库主动消费。第二条新闻使条数达到 2、平均情绪达到 0.5，触发阈值请求：
@@ -564,7 +566,7 @@ bash examples/streaming_database/run.sh
 
 客户端随后暂停集群并追加情绪 0.5、价格 112 的第三条新闻。暂停期间源位置和 MV 不变；resume 后数据库自动消费，条数变为 3、平均情绪仍为 0.5、乘积合计变为 159。旧阈值请求的 once 已消耗，输入仍为 2/0.5/103、指标仍为 51.5；新周期请求重新捕获当前 MV，指标为 159/3=53。
 
-完整[定义](../examples/streaming_database/definition.cpp)同时展示阈值 Trigger 与 Clock 的声明，完整[验证器](../examples/streaming_database/verify.cpp)检查两条不同 shard 的链路。循环中没有客户端 ingest/pump/drain。该例的预期数值并非本轮执行通过记录，验收证据见[当前规格](../specs/news-streaming-example.md)。
+完整[定义](../examples/static_streaming/definition.cpp)同时展示阈值 Trigger 与 Clock 的声明，完整[验证器](../examples/static_streaming/verify.cpp)检查两条不同 shard 的链路。循环中没有客户端 ingest/pump/drain。该例的预期数值并非本轮执行通过记录，验收证据见[当前规格](../specs/news-streaming-example.md)。
 
 ## 11. 缓存、存储提交与 UNKNOWN
 
@@ -635,4 +637,4 @@ Memory snapshot 只在保留原 MemoryStateStore 对象的进程内有效；关�
 
 用一次替换、一次迟到完成或一次 UNKNOWN 思考状态变化：旧值由谁撤回、哪个 revision 已确认、哪个对象仍拥有尚未提交的结果、接下来由谁释放容量。这些问题能区分真实运行语义与名称上的直觉。
 
-查阅具体能力时，可回到对应章节：第 2 节区分静态模块定义、通用运行时与集群 SDK，动态上传仍不在支持范围内；第 1、6 节说明单 shard 提交和同 key 当前一致读取，未提供跨 shard 事务或历史 MVCC；第 9 节说明 Latest 的当前结果选择，完整历史触发见证（TriggerWitness）仍未提供；第 12 节说明数据库托管消息消费，并区分 HTTP 运行示例与尚未验收的真实 Kafka 管线。
+查阅具体能力时，可回到对应章节：第 2 节区分静态模块定义、通用运行时与集群 SDK，静态模块细节仍可参考；当前已支持首次部署前的原生 UDF 上传，见默认流式示例；第 1、6 节说明单 shard 提交和同 key 当前一致读取，未提供跨 shard 事务或历史 MVCC；第 9 节说明 Latest 的当前结果选择，完整历史触发见证（TriggerWitness）仍未提供；第 12 节说明数据库托管消息消费，并区分 HTTP 运行示例与尚未验收的真实 Kafka 管线。

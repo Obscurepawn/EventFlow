@@ -3,6 +3,7 @@
 #include "eventflow/computation_runtime.hpp"
 #include "eventflow/key_codec.hpp"
 #include "eventflow/kv_protocol.hpp"
+#include "eventflow/submitted_computation.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -375,7 +376,7 @@ struct ComputeService::Impl {
 
   StatusOr<Json> install(const Json& body) noexcept {
     EF_RETURN_IF_ERROR(fields(body, {"deployment_version", "recipe", "catalog_fingerprint"},
-                              {"ddl", "shard_count", "recipe_version"}));
+                              {"ddl", "shard_count", "recipe_version", "submitted", "udfs"}));
     if (body.contains("shard_count")) {
       EF_ASSIGN_OR_RETURN(auto requested_shards, kv_protocol::number(body, "shard_count"));
       if (requested_shards != config.shard_count)
@@ -408,7 +409,20 @@ struct ComputeService::Impl {
       }
     }
 
-    EF_ASSIGN_OR_RETURN(auto definition, bind_computation_module(module, statements));
+    const auto submitted = body.value("submitted", Json{});
+    const auto registered = body.value("udfs", Json::array());
+    if (!submitted.is_null() && (!config.allow_native_udfs || module.bind || module.name != "sql"))
+      return blocked("this Compute does not enable submitted native computations");
+    if (!submitted.is_null()) {
+      EF_ASSIGN_OR_RETURN(auto decoded, decode_computation(submitted));
+      if (decoded.ddl != statements)
+        return Status(ErrorCode::Conflict, "installed DDL differs from submitted computation");
+    }
+    EF_ASSIGN_OR_RETURN(auto definition,
+                        submitted.is_null() ? bind_computation_module(module, statements)
+                                            : load_submitted_computation(
+                                                  *store, config.shard_count, submitted, registered,
+                                                  {.shard_count = config.shard_count}));
     if (expected != definition.catalog.fingerprint)
       return Status(ErrorCode::Conflict,
                     "Compute Catalog fingerprint differs from deployment image");
@@ -461,7 +475,11 @@ struct ComputeService::Impl {
       cache_config.max_pending_bytes = limits.max_batch_bytes;
       EF_ASSIGN_OR_RETURN(auto cache, CachedStateStore::open(store, cache_config));
       shard->cache = std::move(cache);
-      EF_ASSIGN_OR_RETURN(auto bound, bind_computation_module(module, ddl));
+      EF_ASSIGN_OR_RETURN(auto bound, submitted.is_null()
+                                          ? bind_computation_module(module, ddl)
+                                          : load_submitted_computation(
+                                                *store, config.shard_count, submitted, registered,
+                                                {.shard_count = config.shard_count}));
       EF_ASSIGN_OR_RETURN(shard->runtime,
                           ComputationRuntime::open(shard->cache, std::move(bound), engine));
     }

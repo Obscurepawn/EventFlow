@@ -1,4 +1,5 @@
 #include "eventflow/cluster_client.hpp"
+#include "eventflow/key_codec.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
@@ -304,7 +305,9 @@ struct ClusterClient::Impl {
   std::mutex mutex;
 
   StatusOr<Json> post(std::string_view operation, const std::string& encoded) noexcept {
-    if (encoded.size() > config.max_request_bytes)
+    const auto request_limit =
+        operation == "register_udf" ? config.max_udf_request_bytes : config.max_request_bytes;
+    if (encoded.size() > request_limit)
       return Status(ErrorCode::ResourceExhausted, "Cluster request exceeds byte limit");
 
     std::lock_guard lock(mutex);
@@ -370,7 +373,8 @@ ClusterClient::open(std::string_view endpoint, const ClusterClientConfig& config
   if (config.timeout_seconds <= 0 || config.timeout_seconds > 3600 || !config.max_request_bytes ||
       config.max_request_bytes > 16 * 1024 * 1024 || !config.max_response_bytes ||
       config.max_response_bytes > 64 * 1024 * 1024 || !config.ingest_attempts ||
-      config.ingest_attempts > 8)
+      config.ingest_attempts > 8 || !config.max_udf_request_bytes ||
+      config.max_udf_request_bytes > 16 * 1024 * 1024)
     return invalid("Invalid bounded Cluster client configuration");
 
   EF_ASSIGN_OR_RETURN(auto address, parse_endpoint(endpoint));
@@ -427,6 +431,23 @@ StatusOr<Json> ClusterClient::catalog() noexcept {
 StatusOr<Json> ClusterClient::ddl(std::string_view sql) noexcept {
   EF_RETURN_IF_ERROR(request_text(sql, impl_->config.max_request_bytes));
   return impl_->call("ddl", Json{{"sql", std::string(sql)}});
+}
+
+StatusOr<FunctionRef> ClusterClient::register_udf(const std::string& library_path) noexcept {
+  EF_ASSIGN_OR_RETURN(auto bytes, read_udf_file(library_path));
+  const auto digest = udf_digest(bytes);
+  EF_ASSIGN_OR_RETURN(auto encoded, hex_encode(bytes));
+  EF_ASSIGN_OR_RETURN(auto result,
+                      impl_->call("register_udf", Json{{"bytes", std::move(encoded)}}));
+  EF_ASSIGN_OR_RETURN(auto ref, decode_function_ref(result));
+  if (ref.digest != digest)
+    return Status(ErrorCode::Conflict, "registered UDF differs from the uploaded bytes");
+  return ref;
+}
+
+StatusOr<Json> ClusterClient::submit_computation(const SubmittedComputation& definition) noexcept {
+  EF_ASSIGN_OR_RETURN(auto encoded, encode_computation(definition));
+  return impl_->call("submit_computation", Json{{"definition", std::move(encoded)}});
 }
 
 StatusOr<Json> ClusterClient::deploy() noexcept {

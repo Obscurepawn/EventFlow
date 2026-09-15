@@ -589,5 +589,32 @@ TEST(CoordinatorService, MismatchedComputeLogicalShardCountRejectsBeforeWrongSha
   EXPECT_NE(take(cluster.client->discover())["state"], "RUNNING");
   EXPECT_EQ(take(store->status(1)).revision, 0);
 }
+
+TEST(CoordinatorService, NativeUdfUnknownCommitRetainsArtifactAndImmutableRegistration) {
+  auto original = memory_store();
+  auto store = std::make_shared<MetaUnknownStore>(original);
+  CoordinatorServiceConfig config;
+  config.shard_count = 2;
+  config.nodes = {{.node_id = "compute", .endpoint = "http://127.0.0.1:1", .shards = {0, 1}}};
+  config.max_request_bytes = 4 * 1024 * 1024;
+  config.allow_native_udfs = true;
+  auto coordinator = take(CoordinatorService::create(store, config));
+  const auto port = take(coordinator->start("127.0.0.1", 0));
+  auto client = take(ClusterClient::open("http://127.0.0.1:" + std::to_string(port)));
+  const auto before = take(store->status(2)).revision;
+  store->arm();
+  const auto unknown = client->register_udf(EVENTFLOW_TEST_UDF_PATH);
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.status().code(), ErrorCode::UnknownCommit);
+  auto ref = take(client->register_udf(EVENTFLOW_TEST_UDF_PATH));
+  EXPECT_EQ(take(store->status(2)).revision, before + 1);
+  const auto key = take(udf_storage_key(2, ref.digest));
+  const auto bytes = take(store->get_many(2, {key}));
+  ASSERT_EQ(bytes.values.size(), 1U);
+  ASSERT_TRUE(bytes.values[0]);
+  EXPECT_EQ(*bytes.values[0], take(read_udf_file(EVENTFLOW_TEST_UDF_PATH)));
+  EXPECT_EQ(take(client->catalog())["udfs"].size(), 1U);
+}
+
 } // namespace
 } // namespace eventflow::test

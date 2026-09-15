@@ -64,7 +64,7 @@ Slots are aligned to `phase + n * every`. The first accepted event for a scope c
 
 | Driver | How to use it |
 | --- | --- |
-| Database-managed Clock | Compile `Trigger::clock(...)` in the application's ComputationModule, bind it and enable Coordinator time advancement. [streaming_database](../../../examples/streaming_database/definition.cpp) defines a 200 ms Clock; the service loop drives it without client pump/drain. The declaration itself starts no thread. |
+| Database-managed Clock | Compile `Trigger::clock(...)` in the application's ComputationModule, bind it and enable Coordinator time advancement. [static_streaming](../../../examples/static_streaming/definition.cpp) defines a 200 ms Clock; the service loop drives it without client pump/drain. The declaration itself starts no thread. |
 | Embedded or explicit progress | An embedded owner must service time and its executor; [ComputationRuntime](../../../src/runtime/computation_runtime.cpp) provides the common implementation. SDK `pump/drain` are bounded explicit control operations, with a supplied logical time, not dynamic rule upload. |
 
 A Coordinator can instead drive installed clocks with its automatic ticker when configured and running. Avoid mixing incompatible synthetic timestamps with wall-clock ticking. Continuing Clock firings do not guarantee continuing successful model requests: candidate expiry, readiness, `.once_per_candidate`, admission prerequisites, executor capacity and retained-state budgets still apply. An expired candidate does not itself delete the key's Clock schedule.
@@ -114,7 +114,7 @@ For any request-producing trigger:
 4. In the pure `on_source(RoundContext&, const ProcessorEvent&) noexcept` callback, return no activation for an ordinary event, or `CandidateActivation{.expected_epoch, .payload}` to open/replace the session. The expected epoch is zero initially or the current epoch; the new deadline must be in the future. Replacement advances the epoch. The owner writes the candidate row.
 5. Attach `.in_session(SessionRef::candidate(candidate_id))` to each request trigger.
 
-The installed policy, session, input and capture relations must share a compatible business-key shape. The current high-level API does not automatically construct candidate policies or support request creation without a candidate. A business revision is not a source offset: your activation callback decides which source changes begin a new candidate epoch. See the complete policy in the [streaming definition](../../../examples/streaming_database/definition.cpp).
+The installed policy, session, input and capture relations must share a compatible business-key shape. The current high-level API does not automatically construct candidate policies or support request creation without a candidate. A business revision is not a source offset: your activation callback decides which source changes begin a new candidate epoch. See the complete policy in the [streaming definition](../../../examples/static_streaming/definition.cpp).
 
 ## Request options and frozen input
 
